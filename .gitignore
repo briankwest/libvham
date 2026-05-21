@@ -1,0 +1,34 @@
+# Credentials (per-user)
+.env
+.env~
+
+# Autoconf-generated (Makefile, configure cache; NOT `configure`
+# itself — we commit the generated script so users don't need
+# autotools installed)
+Makefile
+config.log
+config.status
+autom4te.cache/
+
+# Build outputs
+*.o
+*.a
+*.dSYM/
+test/test_codec
+tools/vham-activate
+tools/vham-login
+tools/vham-call
+tools/vham-session
+tools/vham-voice
+tools/vham-cli
+
+# Editor / IDE
+*~
+.cache/
+compile_commands.json
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
