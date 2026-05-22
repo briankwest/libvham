@@ -771,16 +771,39 @@ static int cmd_transmit(args_t *a) {
      * Captured-bytes reference (radio's outbound channel SETUP):
      *   5 codecs per media: AMR(0x61), iLBC(0x3c), PCMU(0), PCMA(8), AMR-NB(0x65)
      *   reserved=0x13, all clock_rates=8000 (LinkPoon convention) */
+    /* Discover our public IP so the SDP we advertise matches the
+     * post-NAT address the server sees us at. Without this the server's
+     * media bridge may not correlate incoming RTP with our SDP. */
+    uint32_t pub_ip_host = 0;
+    {
+        FILE *p = popen("curl -s --max-time 4 -4 https://ifconfig.me 2>/dev/null", "r");
+        if (p) {
+            char ipstr[64] = {0};
+            if (fgets(ipstr, sizeof ipstr, p)) {
+                struct in_addr ina;
+                if (inet_aton(ipstr, &ina))
+                    pub_ip_host = ntohl(ina.s_addr);
+            }
+            pclose(p);
+        }
+        if (pub_ip_host) {
+            printf("[sdp] advertising public IP %u.%u.%u.%u:%u in CC_SETUP\n",
+                   (pub_ip_host >> 24)&0xff, (pub_ip_host >> 16)&0xff,
+                   (pub_ip_host >>  8)&0xff,  pub_ip_host       &0xff,
+                   rtp_port);
+        }
+    }
     /* media_type=1 (audio), transport=1 (RTP/UDP), reserved=0x13 —
      * values copied byte-for-byte from a captured radio SETUP.
      * family/pad in the PIpAddr = 0xcc (LinkPoon sentinel for "no family"). */
     vham_sdp_t s = {
-        .origin_ipv4 = 0,
+        .origin_ipv4 = pub_ip_host,
+        .origin_port = rtp_port,
         .origin_family = 0xcc,
         .origin_pad   = 0xcc,
         .media_count = 1,
         .media = {{ .media_type = 1, .transport = 1,
-                    .ipv4 = 0, .port = rtp_port,
+                    .ipv4 = pub_ip_host, .port = rtp_port,
                     .family = 0xcc, .pad = 0xcc,
                     .reserved = 0x13,
                     .codec_count = 5 }},
