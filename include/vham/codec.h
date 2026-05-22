@@ -136,6 +136,8 @@ enum vham_ie_tag {
     VHAM_IE_CC_SUBCODE     = 0x0045, /* TLV_NUMBER — channel sub-code (CTCSS-like "Password" on vham.net) */
     VHAM_IE_CC_CALL_EXTNUM = 0x0047, /* TLV_NUMBER — extended called (when '*' present) */
     VHAM_IE_CC_CALLUSERCTRL= 0x0054, /* _TLV_CALLUSERCTRL_s — PTT mic grant payload */
+    VHAM_IE_CC_MIC_ACTION  = 0x0063, /* u32 — CC_INFO MicCtrl action (1=req, 2=rel) */
+    VHAM_IE_CC_MIC_IMTYPE  = 0x0064, /* str — IMType for the call ("GROUP", etc.) */
     VHAM_IE_CC_CALLSTREAMCTRL = 0x0055, /* _TLV_CALLSTREAMCTRL_s */
     VHAM_IE_CC_CALLCONF    = 0x0053, /* CallConf: 11×u8 + NUL-string */
     VHAM_IE_CC_DISPLAY     = 0x0076, /* str — display name / route info */

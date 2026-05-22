@@ -385,20 +385,27 @@ int vham_cc_call_mic_grant(vham_cc_call_t *c, int action,
     if (cc_header_open(&b, c, VHAM_CC_INFO, &tap_len_off, &body_start,
                        &srv_len_off, &srv_body) != 0) return -1;
 
-    /* IE 0x27 (number) — our dispatch number, mirrored from MicCtrl. */
+    /* Mirrors CCFsm::MicCtrl @ 0x2f19f8. The binary emits:
+     *   IE 0x63 (u32) = action  (1 = request, 2 = release)
+     *   IE 0x64 (str) = IMType  ("GROUP" for channel, etc.)
+     *   IE 0x27 (str) = our dispatch number (SrvFillNum at offset 0x83e0)
+     *
+     * Earlier we mistakenly used IE 0x54 (CallUserCtrl composite) here;
+     * that's a *different* CC operation. */
+    if (vham_pack_tlv_u32(&b, 1, VHAM_IE_CC_MIC_ACTION,
+                          (uint32_t)action)) return -1;
+    /* IMType — peer_num is the channel/peer number; for channel calls
+     * the IMType in the original CC_SETUP was "GROUP". We mirror that
+     * by emitting peer_num here; production callers can override via
+     * vham_cc_call_t.priv_num if a different IMType is needed. */
+    if (c->peer_num[0]) {
+        if (vham_pack_tlv_str(&b, 1, VHAM_IE_CC_MIC_IMTYPE, c->peer_num))
+            return -1;
+    }
     if (c->my_num[0]) {
         if (vham_pack_tlv_str(&b, 1, VHAM_IE_IDENTITY_NUM, c->my_num))
             return -1;
     }
-    /* IE 0x54 (CallUserCtrl) body. */
-    vham_call_userctrl_t uc = { .action = (uint8_t)action };
-    strncpy(uc.num_a, c->my_num,   sizeof uc.num_a - 1);
-    strncpy(uc.num_b, c->peer_num, sizeof uc.num_b - 1);
-    uint8_t ucb[80];
-    int ucn = vham_encode_call_userctrl(&uc, ucb, sizeof ucb);
-    if (ucn < 0) return -1;
-    if (vham_pack_tlv_fix(&b, 1, VHAM_IE_CC_CALLUSERCTRL,
-                          ucb, (size_t)ucn)) return -1;
 
     return cc_header_close(&b, c, tap_len_off, body_start,
                            srv_len_off, srv_body);
