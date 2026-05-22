@@ -771,39 +771,91 @@ static int cmd_transmit(args_t *a) {
      * Captured-bytes reference (radio's outbound channel SETUP):
      *   5 codecs per media: AMR(0x61), iLBC(0x3c), PCMU(0), PCMA(8), AMR-NB(0x65)
      *   reserved=0x13, all clock_rates=8000 (LinkPoon convention) */
-    /* Discover our public IP so the SDP we advertise matches the
-     * post-NAT address the server sees us at. Without this the server's
-     * media bridge may not correlate incoming RTP with our SDP. */
-    uint32_t pub_ip_host = 0;
+    /* STUN — get the public IP+port for OUR RTP SOCKET specifically.
+     * `curl ifconfig.me` (used previously) returns the public IP that
+     * service sees, which can differ from what VHAM sees for THIS
+     * socket — NAT maps every (src_port, dst_ip) tuple to a different
+     * (public_port) for symmetric / port-restricted NATs.
+     *
+     * RFC 5389 STUN Binding Request:
+     *   bytes 0..1  = message type (0x0001 = Binding Request)
+     *   bytes 2..3  = message length (0 — no attributes)
+     *   bytes 4..7  = magic cookie 0x2112A442
+     *   bytes 8..19 = transaction ID (12 bytes random)
+     *
+     * Response contains XOR-MAPPED-ADDRESS attribute (type 0x0020)
+     * with the public IP+port we appear as. */
+    uint32_t pub_ip_host  = 0;
+    uint16_t pub_port_host = 0;
     {
-        FILE *p = popen("curl -s --max-time 4 -4 https://ifconfig.me 2>/dev/null", "r");
-        if (p) {
-            char ipstr[64] = {0};
-            if (fgets(ipstr, sizeof ipstr, p)) {
-                struct in_addr ina;
-                if (inet_aton(ipstr, &ina))
-                    pub_ip_host = ntohl(ina.s_addr);
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
+        struct addrinfo *ai = NULL;
+        if (getaddrinfo("stun.l.google.com", "19302", &hints, &ai) == 0 && ai) {
+            uint8_t req[20];
+            req[0] = 0x00; req[1] = 0x01;    /* Binding Request */
+            req[2] = 0x00; req[3] = 0x00;    /* length = 0 */
+            req[4] = 0x21; req[5] = 0x12;    /* magic cookie */
+            req[6] = 0xa4; req[7] = 0x42;
+            for (int i = 8; i < 20; ++i) req[i] = (uint8_t)(rand() & 0xff);
+
+            sendto(rtp_fd, req, sizeof req, 0, ai->ai_addr, ai->ai_addrlen);
+
+            struct timeval tv = { .tv_sec = 2 };
+            setsockopt(rtp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            uint8_t rsp[512];
+            ssize_t rn = recv(rtp_fd, rsp, sizeof rsp, 0);
+            if (rn >= 20 && rsp[0] == 0x01 && rsp[1] == 0x01) {
+                /* Walk attributes for XOR-MAPPED-ADDRESS (0x0020). */
+                size_t off = 20;
+                while (off + 4 <= (size_t)rn) {
+                    uint16_t atype = (uint16_t)((rsp[off] << 8) | rsp[off+1]);
+                    uint16_t alen  = (uint16_t)((rsp[off+2] << 8) | rsp[off+3]);
+                    if (off + 4 + alen > (size_t)rn) break;
+                    if (atype == 0x0020 && alen >= 8) {
+                        /* XOR-MAPPED-ADDRESS:
+                         *   byte 4: 0
+                         *   byte 5: family (1=IPv4)
+                         *   bytes 6..7: port ^ first 2 of magic cookie
+                         *   bytes 8..11: addr ^ magic cookie */
+                        uint16_t xp = (uint16_t)((rsp[off+6] << 8) | rsp[off+7]);
+                        pub_port_host = xp ^ 0x2112;
+                        uint32_t xa = ((uint32_t)rsp[off+8] << 24)
+                                    | ((uint32_t)rsp[off+9] << 16)
+                                    | ((uint32_t)rsp[off+10] << 8)
+                                    |  (uint32_t)rsp[off+11];
+                        pub_ip_host = xa ^ 0x2112a442u;
+                        break;
+                    }
+                    off += 4 + alen + ((alen % 4) ? (4 - alen % 4) : 0);
+                }
             }
-            pclose(p);
+            freeaddrinfo(ai);
         }
         if (pub_ip_host) {
-            printf("[sdp] advertising public IP %u.%u.%u.%u:%u in CC_SETUP\n",
+            printf("[stun] our public RTP endpoint: %u.%u.%u.%u:%u\n",
                    (pub_ip_host >> 24)&0xff, (pub_ip_host >> 16)&0xff,
                    (pub_ip_host >>  8)&0xff,  pub_ip_host       &0xff,
-                   rtp_port);
+                   pub_port_host);
+        } else {
+            printf("[stun] discovery failed — falling back to 0.0.0.0\n");
         }
     }
+    /* Use the STUN-discovered public IP+PORT in the SDP — the server's
+     * media bridge needs these to correlate our RTP source with our
+     * SDP-advertised endpoint. */
+    uint32_t sdp_ipv4 = pub_ip_host ? pub_ip_host : 0;
+    uint16_t sdp_port = pub_port_host ? pub_port_host : rtp_port;
     /* media_type=1 (audio), transport=1 (RTP/UDP), reserved=0x13 —
      * values copied byte-for-byte from a captured radio SETUP.
      * family/pad in the PIpAddr = 0xcc (LinkPoon sentinel for "no family"). */
     vham_sdp_t s = {
-        .origin_ipv4 = pub_ip_host,
-        .origin_port = rtp_port,
+        .origin_ipv4 = sdp_ipv4,
+        .origin_port = sdp_port,
         .origin_family = 0xcc,
         .origin_pad   = 0xcc,
         .media_count = 1,
         .media = {{ .media_type = 1, .transport = 1,
-                    .ipv4 = pub_ip_host, .port = rtp_port,
+                    .ipv4 = sdp_ipv4, .port = sdp_port,
                     .family = 0xcc, .pad = 0xcc,
                     .reserved = 0x13,
                     .codec_count = 5 }},
