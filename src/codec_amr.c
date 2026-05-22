@@ -68,24 +68,53 @@ typedef struct {
 } amrwb_state_t;
 static amrwb_state_t g_wb;
 
+/* AMR-WB mode → speech bits (per 3GPP TS 26.201 §A.2 / RFC 4867 §3.3). */
+static const int amrwb_mode_bits[9] = {
+    132, 177, 253, 285, 317, 365, 397, 461, 477
+};
+
 static int amrwb_enc(vham_audio_codec_t *c,
                      const int16_t *pcm, size_t n_samples,
                      uint8_t *out, size_t out_cap) {
     amrwb_state_t *s = (amrwb_state_t *)c->state;
-    if (!s || !s->enc || n_samples != 320 || out_cap < 61) return -1;
-    /* Mode 8 = 23.85 kbps, max quality.
+    if (!s || !s->enc || n_samples != 320 || out_cap < 64) return -1;
+
+    /* Encode into a private IF1-format buffer. */
+    uint8_t if1[64];
+    int n = E_IF_encode(s->enc, 8, pcm, if1, 0);
+    if (n <= 0) return -1;
+
+    /* RFC 4867 §4.4 (octet-aligned). Most PoC servers accept this;
+     * bandwidth-efficient (§4.3) is sometimes mandatory. We try
+     * octet-aligned first — it's simpler and many servers/clients
+     * default to it.
      *
-     * NB: E_IF_encode writes 3GPP TS 26.201 §A.2 IF1 storage format
-     * (one header byte + speech). That isn't a valid RTP payload —
-     * RFC 4867 §4.3 (bandwidth-efficient) or §4.4 (octet-aligned)
-     * rearranges the same bits into a CMR + ToC + speech layout.
+     * IF1 byte 0 layout (3GPP TS 26.201 §A.2.1):
+     *   bit 7..4 = frame type (mode, 0..8)
+     *   bit 3..1 = padding (reserved)
+     *   bit 0    = Q (frame quality)
      *
-     * Today this is fine for offline round-trip tests (encode →
-     * decode in the same lib), but for wire interop a 50-LOC
-     * IF1 → octet-aligned wrapper is still missing. See
-     * protocol-spec/99-audit.md "Known wire-format gap". */
-    int n = E_IF_encode(s->enc, 8, pcm, out, 0);
-    return n < 0 ? -1 : n;
+     * RFC 4867 §4.4 payload layout for ONE frame:
+     *   byte 0 (CMR):  high nibble = mode (0..8) or 0xF for "no request"
+     *                  low nibble  = 0
+     *   byte 1 (ToC):  bit 7 = F (more frames follow) = 0 for single
+     *                  bits 6..3 = FT (mode/frame type)
+     *                  bit 2 = Q (quality)
+     *                  bits 1..0 = 0
+     *   bytes 2..N  = speech bytes (copied from IF1 bytes 1..N) */
+    uint8_t hdr = if1[0];
+    uint8_t mode  = (hdr >> 4) & 0x0F;
+    uint8_t q_bit = hdr & 0x01;
+    if (mode > 8) return -1;
+    int speech_bits = amrwb_mode_bits[mode];
+    int speech_bytes = (speech_bits + 7) / 8;
+    if (1 + speech_bytes > n) return -1;   /* sanity */
+
+    if (out_cap < (size_t)(2 + speech_bytes)) return -1;
+    out[0] = (uint8_t)(0xF0);                                 /* CMR = no req */
+    out[1] = (uint8_t)((mode << 3) | (q_bit << 2));           /* ToC */
+    memcpy(out + 2, if1 + 1, (size_t)speech_bytes);
+    return 2 + speech_bytes;
 }
 
 static int amrwb_dec(vham_audio_codec_t *c,

@@ -129,8 +129,13 @@ enum vham_ie_tag {
     VHAM_IE_SYS_TIME       = 0x008c, /* 16-byte P_TIME (8x BE u16) */
 
     /* Call-control IEs (CC_SETUP and friends) */
-    VHAM_IE_CC_CALLED_NUM  = 0x000d, /* TLV_NUMBER — destination */
-    VHAM_IE_CC_CALLING_NUM = 0x000e, /* TLV_NUMBER — origin */
+    /* The binary's CCFsm::UserMakeOut copies the CALLER's number into
+     * IE 0x0d (offset 0x1d8) and the CALLEE/peer into IE 0x0e (offset
+     * 0x21c) — the opposite of common SIP convention. Confirmed via
+     * static analysis vs SrvPackMsg's `SrvPackNum(_, 0xd, ...)` and
+     * `SrvPackNum(_, 0xe, ...)` calls. */
+    VHAM_IE_CC_CALLING_NUM = 0x000d, /* TLV_NUMBER — caller (us) */
+    VHAM_IE_CC_CALLED_NUM  = 0x000e, /* TLV_NUMBER — peer / channel */
     VHAM_IE_CC_SDP_A       = 0x0019, /* nested _TLV_SDP_s (offer) */
     VHAM_IE_CC_SERVICE     = 0x0023, /* u32 — call service type */
     VHAM_IE_CC_SUBCODE     = 0x0045, /* TLV_NUMBER — channel sub-code (CTCSS-like "Password" on vham.net) */
@@ -140,7 +145,13 @@ enum vham_ie_tag {
     VHAM_IE_CC_MIC_IMTYPE  = 0x0064, /* str — IMType for the call ("GROUP", etc.) */
     VHAM_IE_CC_CALLSTREAMCTRL = 0x0055, /* _TLV_CALLSTREAMCTRL_s */
     VHAM_IE_CC_CALLCONF    = 0x0053, /* CallConf: 11×u8 + NUL-string */
+    VHAM_IE_CC_CAMINFO     = 0x002e, /* SrvPackCamInfo — 17-byte composite */
+    VHAM_IE_CC_GROUPFLAG   = 0x0030, /* u8 — set to 1 for channel/group calls */
+    VHAM_IE_CC_BANDWIDTH   = 0x0036, /* u32 — channel/call bandwidth (binary uses 64) */
+    VHAM_IE_CC_CHAN_NAME   = 0x0046, /* str — channel display name (= channel ID) */
+    VHAM_IE_CC_CHAN_NUM2   = 0x0047, /* TLV_NUMBER — channel as Num */
     VHAM_IE_CC_DISPLAY     = 0x0076, /* str — display name / route info */
+    VHAM_IE_CC_CHAN_FLAG   = 0x007a, /* u8 — flag (radio sends 2 for channel TX) */
     VHAM_IE_CC_PRIV_NUM    = 0x007e, /* TLV_NUMBER — private/sub number */
 };
 

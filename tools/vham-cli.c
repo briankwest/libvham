@@ -675,6 +675,42 @@ static int cmd_transmit(args_t *a) {
            (cli.media_gw_ipv4) & 0xff,
            cli.media_gw_port);
 
+    /* Step 0 — handle YaoYun feature negotiation. After login the
+     * server pushes MM_PASSTHROUGH with `{"YaoYun":"<n>"}`. Per
+     * MM::UpdateYaoYun in the binary, the client MUST echo this
+     * back. Until the YaoYun gate flips to 0, IDT_CallMakeOut is
+     * blocked client-side AND the server treats our CC_SETUPs as
+     * no-op status updates (TAP-ACK + MM_REGRSP, no CC response).
+     * This is the missing handshake step. */
+    struct timeval tv = { .tv_sec = 1 };
+    setsockopt(sig_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    uint8_t resp[2048];
+    for (int g = 0; g < 10; ++g) {
+        ssize_t r = recv(sig_fd, resp, sizeof resp, 0);
+        if (r < 0) break;
+        uint16_t flags = (uint16_t)((resp[2] << 8) | resp[3]);
+        uint16_t cls   = (uint16_t)((resp[8]  << 8) | resp[9]);
+        uint16_t cmd   = (uint16_t)((resp[10] << 8) | resp[11]);
+        if (flags == VHAM_TAP_FLAG_ACK) continue;
+        if (cls == VHAM_TAP_CLASS_MM && cmd == VHAM_MM_PASSTHROUGH) {
+            vham_passthrough_t p;
+            if (vham_parse_passthrough(resp, (size_t)r, &p) == 0) {
+                int yy = vham_passthrough_yaoyun_value(&p);
+                if (yy >= 0) {
+                    printf("[yy] received YaoYun=%d — acking\n", yy);
+                    uint8_t ack[256];
+                    cli.seq_no += 1;
+                    int an = vham_build_yaoyun_ack(cli.seq_no, a->user,
+                                                   p.have_src ? p.src_num : "",
+                                                   "YaoYun", yy,
+                                                   ack, sizeof ack);
+                    if (an > 0) send(sig_fd, ack, (size_t)an, 0);
+                    break;
+                }
+            }
+        }
+    }
+
     /* Step 1 — STATUSSUBS so the server tags us as the channel TX. */
     cli.seq_no += 1;
     uint8_t sb[256];
@@ -682,61 +718,128 @@ static int cmd_transmit(args_t *a) {
                                     VHAM_SUBS_DETAILED, 1, sb, sizeof sb);
     if (sn > 0) send(sig_fd, sb, (size_t)sn, 0);
     /* Drain any TAP-ACK + notify echoes. */
-    struct timeval tv = { .tv_sec = 1 };
-    setsockopt(sig_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    uint8_t resp[2048];
     for (int g = 0; g < 3; ++g) { if (recv(sig_fd, resp, sizeof resp, 0) <= 0) break; }
 
-    /* Step 2 — open the RTP socket so we know our local port. */
+    /* Compute call mode early so the RTP-socket bind can use the
+     * correct deterministic port (MEDPORT + leg_id * 4 per idt.ini).
+     *
+     * leg_id is the SRVMSG.dwSrcFsmId. The binary calls PResItem::
+     * GetId() to allocate a unique short — radio's was 891 (0x37b).
+     * Pick a random short to avoid colliding with a previous
+     * session's leg (server may dedup CC_SETUPs by (src,leg)). */
+    int peer_numeric = 1;
+    for (const char *pp = a->to; *pp; ++pp)
+        if (*pp < '0' || *pp > '9') { peer_numeric = 0; break; }
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
+    uint32_t leg_id = (uint32_t)(rand() % 800 + 100);   /* 100..899 */
+    uint32_t srv_type = peer_numeric ? VHAM_CALL_FULL_DUPLEX
+                                     : VHAM_CALL_HALF_DUPLEX;
+    const char *subcode = peer_numeric ? a->to : NULL;
+
+    /* Step 2 — open the RTP socket on the DETERMINISTIC port the
+     * server expects. Per idt.ini SYSTEM section: MEDPORT=20000 is
+     * the base. CIDTLeg::InitMySdp computes the leg's RTP port as
+     * `base + leg_id * 4`. For leg_id=9 (channel call), port=20036.
+     * The server validates incoming RTP against this expected source
+     * port — using an ephemeral port causes the server to silently
+     * drop our outbound media even though signaling TAP-ACKs OK. */
+    const uint16_t MEDPORT_BASE = 20000;
+    uint16_t rtp_port = (uint16_t)(MEDPORT_BASE + leg_id * 4);
     int rtp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (rtp_fd < 0) { perror("socket"); close(sig_fd); return 1; }
-    struct sockaddr_in local = { .sin_family = AF_INET, .sin_port = 0,
-                                  .sin_addr = { .s_addr = htonl(INADDR_ANY) } };
+    /* SO_REUSEADDR so concurrent transmit runs don't EADDRINUSE. */
+    int reuse = 1;
+    setsockopt(rtp_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+    struct sockaddr_in local = { .sin_family = AF_INET,
+                                  .sin_port   = htons(rtp_port),
+                                  .sin_addr   = { .s_addr = htonl(INADDR_ANY) } };
     if (bind(rtp_fd, (struct sockaddr *)&local, sizeof local) < 0) {
-        perror("bind"); close(rtp_fd); close(sig_fd); return 1;
+        perror("bind");
+        fprintf(stderr, "fatal: cannot bind to deterministic port %u — "
+                        "is another vham-cli still running?\n", rtp_port);
+        close(rtp_fd); close(sig_fd); return 1;
     }
-    socklen_t llen = sizeof local;
-    getsockname(rtp_fd, (struct sockaddr *)&local, &llen);
-    uint16_t rtp_port = ntohs(local.sin_port);
-    printf("local RTP port: %u\n", rtp_port);
+    printf("local RTP port: %u  (MEDPORT base 20000 + leg %u * 4)\n",
+           rtp_port, leg_id);
 
-    /* Step 3 — CC_SETUP with our RTP port in the SDP. */
+    /* Step 3 — CC_SETUP with our RTP port + the same multi-codec
+     * advertisement the real LinkPoon client sends. The actual codec
+     * we'll transmit with is `pt` (--codec arg); we just list all
+     * supported codecs so the server can pick the right one for
+     * each receiver.
+     *
+     * Captured-bytes reference (radio's outbound channel SETUP):
+     *   5 codecs per media: AMR(0x61), iLBC(0x3c), PCMU(0), PCMA(8), AMR-NB(0x65)
+     *   reserved=0x13, all clock_rates=8000 (LinkPoon convention) */
+    /* media_type=1 (audio), transport=1 (RTP/UDP), reserved=0x13 —
+     * values copied byte-for-byte from a captured radio SETUP.
+     * family/pad in the PIpAddr = 0xcc (LinkPoon sentinel for "no family"). */
     vham_sdp_t s = {
-        .origin_ipv4 = 0,         /* server fills in from packet src */
+        .origin_ipv4 = 0,
+        .origin_family = 0xcc,
+        .origin_pad   = 0xcc,
         .media_count = 1,
-        .media = {{ .media_type = 0, .transport = 0,
+        .media = {{ .media_type = 1, .transport = 1,
                     .ipv4 = 0, .port = rtp_port,
-                    .codec_count = 1,
-                    .codecs = {{ .payload_type = pt,
-                                 .encoding_param = 1,
-                                 .clock_rate = clock_rate }} }},
+                    .family = 0xcc, .pad = 0xcc,
+                    .reserved = 0x13,
+                    .codec_count = 5 }},
     };
-    const char *codec_label =
-        pt == 0   ? "PCMU"   : pt == 8   ? "PCMA"   :
-        pt == 96  ? "AMR"    : pt == 97  ? "AMR-WB" :
-        pt == 102 ? "iLBC"   : pt == 106 ? "opus"   : "L16";
-    snprintf(s.media[0].codecs[0].name,
-             sizeof s.media[0].codecs[0].name, "%s", codec_label);
+    /* codec[0] = AMR (PT 0x61=97), clock 8000 — the binary uses
+     * this even though AMR-WB is "wideband 16kHz" — the SDP carrier
+     * clock is 8000 by LinkPoon convention */
+    s.media[0].codecs[0].payload_type   = 0x61;
+    s.media[0].codecs[0].encoding_param = 1;
+    s.media[0].codecs[0].clock_rate     = 8000;
+    s.media[0].codecs[0].num_params     = 1;
+    snprintf(s.media[0].codecs[0].name,    sizeof s.media[0].codecs[0].name,    "AMR");
+    snprintf(s.media[0].codecs[0].param_a, sizeof s.media[0].codecs[0].param_a, "<");
+    /* codec[1] = iLBC (PT 0x3c=60) */
+    s.media[0].codecs[1].payload_type   = 0x3c;
+    s.media[0].codecs[1].encoding_param = 1;
+    s.media[0].codecs[1].clock_rate     = 8000;
+    snprintf(s.media[0].codecs[1].name, sizeof s.media[0].codecs[1].name, "iLBC");
+    /* codec[2] = PCMU (PT 0) */
+    s.media[0].codecs[2].payload_type   = 0;
+    s.media[0].codecs[2].encoding_param = 1;
+    s.media[0].codecs[2].clock_rate     = 8000;
+    snprintf(s.media[0].codecs[2].name, sizeof s.media[0].codecs[2].name, "PCMU");
+    /* codec[3] = PCMA (PT 8) */
+    s.media[0].codecs[3].payload_type   = 8;
+    s.media[0].codecs[3].encoding_param = 1;
+    s.media[0].codecs[3].clock_rate     = 8000;
+    snprintf(s.media[0].codecs[3].name, sizeof s.media[0].codecs[3].name, "PCMA");
+    /* codec[4] = AMR-NB (PT 0x74=116). The radio's wire uses this
+     * name explicitly distinct from AMR. */
+    s.media[0].codecs[4].payload_type   = 0x74;
+    s.media[0].codecs[4].encoding_param = 1;
+    s.media[0].codecs[4].clock_rate     = 0x128e;   /* mirrors radio's odd value */
+    snprintf(s.media[0].codecs[4].name, sizeof s.media[0].codecs[4].name, "AMR-NB");
+    (void)pt; (void)clock_rate;   /* used for the actual RTP framing */
     uint8_t sdp[1024];
     int sdp_n = vham_build_sdp_body(&s, sdp, sizeof sdp);
     if (sdp_n <= 0) { close(rtp_fd); close(sig_fd); return 1; }
     vham_cc_call_t call;
-    /* Per com.ids.idtma.media.CSAudio:
-     *   audioHalfCall (user→user) uses leg_id=7, no subcode
-     *   audioGroupCall (channel)  uses leg_id=9, subcode="00"
-     * Auto-detect: pure-numeric peer = channel, anything else = user. */
-    int peer_numeric = 1;
-    for (const char *p = a->to; *p; ++p)
-        if (*p < '0' || *p > '9') { peer_numeric = 0; break; }
-    uint32_t leg_id = peer_numeric ? 9 : 7;
-    const char *subcode = peer_numeric ? "00" : NULL;
-    printf("call mode: %s (leg=%u, subcode=%s)\n",
+    /* leg_id / srv_type / subcode already computed above (before
+     * RTP socket bind so the deterministic port matches). */
+    printf("call mode: %s  (leg=%u  srvType=0x%x  subcode=%s)\n",
            peer_numeric ? "channel/group" : "user-to-user",
-           leg_id, subcode ? subcode : "<none>");
+           leg_id, srv_type, subcode ? subcode : "<none>");
     vham_cc_call_init(&call, a->user, a->to, leg_id);
+    /* Continue the session's TAP seq number — radio's outbound uses
+     * a large running counter (e.g. 0x8e460b95), not a per-call reset
+     * to 1. Server may dedupe / reject low seqs as stale. */
+    cli.seq_no += 1;
+    call.seq_no = cli.seq_no - 1;   /* +1 happens inside cc_call_emit */
     uint8_t buf[2048];
+    /* IMPORTANT: re-include auth IEs in CC_SETUP. The radio's outbound
+     * SETUP DOES include them; the SERVER-FORWARDED version we capture
+     * has them stripped (server strips auth before forwarding to other
+     * callees). When we omit them, the server responds with a fresh
+     * MD5 challenge as MM_REGRSP — that's the "no per-call port
+     * allocated, just status echo" behavior we kept seeing. */
     int n = vham_cc_call_emit(&call, sdp, (size_t)sdp_n,
-                              VHAM_CALL_HALF_DUPLEX, subcode,
+                              srv_type, subcode,
                               cli.last_algorithm, cli.last_nonce,
                               cli.last_realm, cli.last_response_hex,
                               buf, sizeof buf);
@@ -745,6 +848,12 @@ static int cmd_transmit(args_t *a) {
         close(rtp_fd); close(sig_fd); return 1;
     }
     printf("CC_SETUP sent (%d bytes) to %s\n", n, a->to);
+    printf("[cc] RAW outbound SETUP:\n");
+    for (int i = 0; i < n; ++i) {
+        if (i % 16 == 0) printf("  %04x: ", i);
+        printf("%02x ", buf[i]);
+        if (i % 16 == 15 || i == n - 1) printf("\n");
+    }
 
     /* Step 4 — wait briefly for ACK / CONN / mic-grant. Some channels
      * grant the mic implicitly with SETUPACK; others require an
@@ -828,13 +937,22 @@ static int cmd_transmit(args_t *a) {
         }
         if (cmd == VHAM_CC_SETUPACK || cmd == VHAM_CC_CONN
             || cmd == VHAM_CC_INFO) {
-            printf("%s\n",
+            printf("%s (%zd bytes)\n",
                 cmd == VHAM_CC_SETUPACK ? "CC_SETUPACK" :
-                cmd == VHAM_CC_CONN     ? "CC_CONN" : "CC_INFO");
+                cmd == VHAM_CC_CONN     ? "CC_CONN" : "CC_INFO", r);
+            if (cmd == VHAM_CC_CONN) {
+                printf("[cc] RAW CC_CONN body:\n");
+                for (ssize_t i = 32; i < r; ++i) {
+                    if ((i - 32) % 16 == 0) printf("  %04zx: ", i - 32);
+                    printf("%02x ", resp[i]);
+                    if ((i - 32) % 16 == 15 || i == r - 1) printf("\n");
+                }
+            }
             /* Parse IE 0x19 SDP — extract per-call media destination. */
             const uint8_t *body = resp + 32;
             size_t blen = (size_t)r - 32;
             size_t off = 0;
+            int found_sdp = 0;
             while (off + 4 <= blen) {
                 uint16_t tag = (uint16_t)((body[off] << 8) | body[off+1]);
                 uint16_t len = (uint16_t)((body[off+2] << 8) | body[off+3]);
@@ -847,17 +965,52 @@ static int cmd_transmit(args_t *a) {
                                           ? p.media[0].ipv4
                                           : cli.media_gw_ipv4;
                         peer_media_port = p.media[0].port;
-                        printf("[cc] server media endpoint: %u.%u.%u.%u:%u\n",
+                        printf("[cc] server media endpoint: %u.%u.%u.%u:%u (from %s)\n",
                                (peer_media_ip >> 24)&0xff,
                                (peer_media_ip >> 16)&0xff,
                                (peer_media_ip >>  8)&0xff,
                                 peer_media_ip       &0xff,
-                                peer_media_port);
+                                peer_media_port,
+                                cmd == VHAM_CC_CONN ? "CC_CONN" : "frame");
+                        printf("[cc] server SDP: %u media stream(s)\n",
+                               p.media_count);
+                        for (uint8_t mi = 0; mi < p.media_count; ++mi) {
+                            printf("[cc]   media[%u]: port=%u transport=%u media_type=%u, %u codec(s):\n",
+                                   mi, p.media[mi].port,
+                                   p.media[mi].transport,
+                                   p.media[mi].media_type,
+                                   p.media[mi].codec_count);
+                            for (uint8_t ci = 0; ci < p.media[mi].codec_count; ++ci) {
+                                printf("[cc]     pt=%u name=%s clock=%u\n",
+                                       p.media[mi].codecs[ci].payload_type,
+                                       p.media[mi].codecs[ci].name,
+                                       p.media[mi].codecs[ci].clock_rate);
+                            }
+                        }
+                        found_sdp = 1;
                     }
                 }
                 off += 4 + len;
             }
-            got_grant = 1;
+            /* Only mark got_grant when we've actually got the SDP —
+             * bare CC_SETUPACK (32 bytes) carries no body. The per-call
+             * port arrives in the FOLLOWING CC_CONN frame. */
+            if (found_sdp || cmd == VHAM_CC_INFO) got_grant = 1;
+            /* On CC_CONN, advance our state machine and send the
+             * CC_CONNACK the server is waiting for. Without it, the
+             * server tears down with CC_REL after a brief timeout. */
+            if (cmd == VHAM_CC_CONN) {
+                vham_cc_call_recv(&call, resp, (size_t)r);
+                uint8_t ack[256];
+                int an = vham_cc_call_emit(&call, NULL, 0,
+                                           srv_type, NULL,
+                                           NULL, NULL, NULL, NULL,
+                                           ack, sizeof ack);
+                if (an > 0) {
+                    send(sig_fd, ack, (size_t)an, 0);
+                    printf("[cc] CC_CONNACK sent (%d bytes)\n", an);
+                }
+            }
         }
         else if (cmd == VHAM_CC_REL)  {
             vham_cc_call_recv(&call, resp, (size_t)r);
@@ -972,8 +1125,26 @@ static int cmd_transmit(args_t *a) {
                                          i == 0 ? 1 : 0,
                                          pkt, sizeof pkt);
         if (pn > 0) {
-            if (sendto(rtp_fd, pkt, (size_t)pn, 0,
-                       (struct sockaddr *)&dst, sizeof dst) > 0) sent_ok++;
+            errno = 0;
+            ssize_t sent_n = sendto(rtp_fd, pkt, (size_t)pn, 0,
+                                    (struct sockaddr *)&dst, sizeof dst);
+            int err_after = errno;
+            if (i == 0 || i == 50) {
+                printf("[rtp] frame[%zu]: sendto=%zd errno=%d (%s)\n",
+                       i, sent_n, err_after,
+                       err_after ? strerror(err_after) : "OK");
+            }
+            /* Track persistent ICMP/timeout errors. */
+            if (err_after == ETIMEDOUT || err_after == ECONNREFUSED) {
+                /* This is what tells us the server isn't listening
+                 * on the per-call port. Kernel got ICMP back. */
+                if (i == 0) {
+                    printf("[rtp] !!! kernel reports ICMP unreachable —\n"
+                           "      the destination port %u isn't open server-side\n",
+                           cli.media_gw_port);
+                }
+            }
+            if (sent_n > 0) sent_ok++;
         }
         /* drain any signaling activity without blocking */
         ssize_t r = recv(sig_fd, resp, sizeof resp, MSG_DONTWAIT);
@@ -1185,6 +1356,13 @@ static int cmd_listen(args_t *a) {
                        n.sub_opcode, n.notify_status, n.echoed_num);
             }
         } else if (cls == VHAM_TAP_CLASS_CC && cmd == VHAM_CC_SETUP) {
+            /* Hex-dump the entire frame for comparison with our TX. */
+            printf("[cc] RAW inbound SETUP (%zd bytes):\n", r);
+            for (ssize_t i = 0; i < r; ++i) {
+                if (i % 16 == 0) printf("  %04zx: ", i);
+                printf("%02x ", resp[i]);
+                if (i % 16 == 15 || i == r - 1) printf("\n");
+            }
             /* Walk IEs in the SETUP body to find IE 0x19 (SDP). The
              * server's SDP tells us where the PER-CALL media gateway
              * port is (different from the REGRSP media_gw_port). */

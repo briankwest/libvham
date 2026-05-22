@@ -140,12 +140,15 @@ int vham_cc_call_emit(vham_cc_call_t *c,
         }
         s.display_str = peer_is_numeric ? "GROUP"
                                          : "{\"pfCallIn\": \"HALFSINGLE\"}";
-        /* CallConf bytes for a half-duplex PTT call with
-         * MEDIAATTR[0]=0 (the most common path through the binary). */
-        if (service_type == VHAM_CALL_HALF_DUPLEX) {
-            s.callconf_bytes[ 0] = 1;   /* offset 4 → byte 0 (after the 4-byte TLV-NUMBER hdr is sliced) */
-            s.callconf_bytes[ 1] = 1;   /* offset 5 */
-            s.callconf_bytes[ 9] = 1;   /* offset 0xd */
+        /* CallConf bytes — the binary sets these for both half-duplex
+         * single calls AND channel/group calls (full-duplex 0x12). The
+         * marker triplet {1, 1, 1} at offsets 0, 1, 9 is the
+         * "MEDIAATTR[0]=0" default — common path through the binary. */
+        if (service_type == VHAM_CALL_HALF_DUPLEX
+            || service_type == VHAM_CALL_FULL_DUPLEX) {
+            s.callconf_bytes[ 0] = 1;
+            s.callconf_bytes[ 1] = 1;
+            s.callconf_bytes[ 9] = 1;
         }
         int n = vham_build_cc_setup(&s, out, out_cap);
         if (n > 0) c->state = VHAM_CALL_SETUP_SENT;
@@ -479,29 +482,68 @@ int vham_build_cc_setup(const vham_cc_setup_t *p, void *out, size_t out_cap) {
         return -1;
     if (vham_pack_tlv_u32(&b, 1, VHAM_IE_CC_SERVICE, p->service_type))
         return -1;
+    /* Channel calls (FULL_DUPLEX) include IEs 0x2e/0x30/0x36 that
+     * half-duplex single calls omit. Byte-pattern matched against
+     * a captured inbound channel SETUP from us.vham.net. */
+    if (p->service_type == VHAM_CALL_FULL_DUPLEX) {
+        /* IE 0x27 (our num) — duplicated as IE 0x28 by some servers
+         * and the real client; harmless to repeat. */
+        if (vham_pack_tlv_str(&b, 1, VHAM_IE_IDENTITY_NUM, p->calling_num))
+            return -1;
+        if (vham_pack_tlv_str(&b, 1, 0x0028, p->calling_num))
+            return -1;
+        /* IE 0x2e — CamInfo composite. The captured payload is mostly
+         * zeros with the string "0.0.0.0" at bytes 2..10 — that's
+         * the placeholder camera-ip field for an audio-only call. */
+        static const uint8_t caminfo_default[17] = {
+            0x00, 0x00, '0','.','0','.','0','.','0', 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        };
+        if (vham_pack_tlv_fix(&b, 1, VHAM_IE_CC_CAMINFO,
+                              caminfo_default, sizeof caminfo_default))
+            return -1;
+        /* IE 0x30 — group/channel flag (u8 = 1). */
+        if (vham_pack_tlv_u8 (&b, 1, VHAM_IE_CC_GROUPFLAG, 1))
+            return -1;
+        /* IE 0x36 — bandwidth/limit (u32 = 64 in the capture). */
+        if (vham_pack_tlv_u32(&b, 1, VHAM_IE_CC_BANDWIDTH, 64))
+            return -1;
+    }
     /* IE 0x45 — channel sub-code (CTCSS-style). Emitted only if
      * the caller supplied one for the channel they're calling. */
     if (p->channel_subcode && *p->channel_subcode &&
         vham_pack_tlv_str(&b, 1, VHAM_IE_CC_SUBCODE, p->channel_subcode))
         return -1;
 
-    /* IE 0x53 — CallConf. Binary always emits this for CC_SETUP. */
-    if (p->include_callconf) {
-        const char *cc_str = p->callconf_str ? p->callconf_str : "";
-        size_t cc_str_len  = strlen(cc_str);
-        uint16_t total_len = (uint16_t)(11 + cc_str_len + 1);  /* 11 bytes + str + NUL */
-        if (vham_pack_u16(&b, VHAM_IE_CC_CALLCONF)) return -1;
-        if (vham_pack_u16(&b, total_len))           return -1;
-        for (int i = 0; i < 11; ++i) {
-            if (vham_pack_u8(&b, p->callconf_bytes[i])) return -1;
+    /* For channel calls (FULL_DUPLEX), the binary emits the channel
+     * number in IE 0x45 (str), IE 0x46 (str), AND IE 0x47 (TLV_NUMBER).
+     * Plus IE 0x7a (u8=2). IE 0x53/0x76 are NOT emitted for channel
+     * calls — those are for user-to-user (HALF_DUPLEX) only. */
+    if (p->service_type == VHAM_CALL_FULL_DUPLEX
+        && p->channel_subcode && *p->channel_subcode) {
+        if (vham_pack_tlv_str(&b, 1, VHAM_IE_CC_CHAN_NAME, p->channel_subcode))
+            return -1;
+        if (vham_pack_tlv_str(&b, 1, VHAM_IE_CC_CHAN_NUM2, p->channel_subcode))
+            return -1;
+        if (vham_pack_tlv_u8 (&b, 1, VHAM_IE_CC_CHAN_FLAG, 2))
+            return -1;
+    } else {
+        /* User-to-user (half-duplex) path: IE 0x53 + IE 0x76 (IMType). */
+        if (p->include_callconf) {
+            const char *cc_str = p->callconf_str ? p->callconf_str : "";
+            size_t cc_str_len  = strlen(cc_str);
+            uint16_t total_len = (uint16_t)(11 + cc_str_len + 1);
+            if (vham_pack_u16(&b, VHAM_IE_CC_CALLCONF)) return -1;
+            if (vham_pack_u16(&b, total_len))           return -1;
+            for (int i = 0; i < 11; ++i) {
+                if (vham_pack_u8(&b, p->callconf_bytes[i])) return -1;
+            }
+            if (vham_pack_str(&b, cc_str)) return -1;
         }
-        if (vham_pack_str(&b, cc_str)) return -1;
+        if (p->display_str && *p->display_str &&
+            vham_pack_tlv_str(&b, 1, VHAM_IE_CC_DISPLAY, p->display_str))
+            return -1;
     }
-
-    /* IE 0x76 — display string (optional) */
-    if (p->display_str && *p->display_str &&
-        vham_pack_tlv_str(&b, 1, VHAM_IE_CC_DISPLAY, p->display_str))
-        return -1;
 
     /* IE 0x7e — private/sub number (optional) */
     if (p->priv_num && *p->priv_num &&
