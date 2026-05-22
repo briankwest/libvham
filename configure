@@ -1353,9 +1353,9 @@ Optional Packages:
        --without-amr           disable AMR-NB and AMR-WB codecs (PT 96/97) support
   --with-ilbc             enable iLBC codec (PT 102) support (default: auto)
        --without-ilbc          disable iLBC codec (PT 102) support
-  --with-dtls             enable DTLS-SRTP (mbedtls 3 + libsrtp2) support
-                          (default: auto)
-       --without-dtls          disable DTLS-SRTP (mbedtls 3 + libsrtp2) support
+  --with-dtls=auto|mbedtls|openssl|no
+                          DTLS-SRTP backend (default: auto, prefers mbedtls
+                          when both present)
 
 Some influential environment variables:
   CC          C compiler command
@@ -4445,7 +4445,6 @@ printf %s "checking whether iLBC codec (PT 102) support is enabled... " >&6; }
 printf "%s\n" "$HAVE_ilbc" >&6; }
 
 
-HAVE_dtls=no
 
 
 # Check whether --with-dtls was given.
@@ -4458,22 +4457,85 @@ esac
 fi
 
 
-  if test "x$WITH_dtls" != "xno"; then
+HAVE_dtls=no
+DTLS_BACKEND=none
 
-  saved_CPPFLAGS=$CPPFLAGS
-  saved_LDFLAGS=$LDFLAGS
-  if test "x$BREW" != x; then
-    MBEDTLS3_PREFIX=`$BREW --prefix mbedtls@3 2>/dev/null`
-    if test -n "$MBEDTLS3_PREFIX" && test -d "$MBEDTLS3_PREFIX/include"; then
-      { printf "%s\n" "$as_me:${as_lineno-$LINENO}: found mbedtls@3 at $MBEDTLS3_PREFIX" >&5
-printf "%s\n" "$as_me: found mbedtls@3 at $MBEDTLS3_PREFIX" >&6;}
-      CPPFLAGS="-I$MBEDTLS3_PREFIX/include $CPPFLAGS"
-      LDFLAGS="-L$MBEDTLS3_PREFIX/lib $LDFLAGS"
-      DTLS_CFLAGS="-I$MBEDTLS3_PREFIX/include"
-      DTLS_LIBS_PREFIX="-L$MBEDTLS3_PREFIX/lib"
+if test "x$WITH_dtls" != "xno"; then
+    HAVE_srtp2=no
+  ac_fn_c_check_header_compile "$LINENO" "srtp2/srtp.h" "ac_cv_header_srtp2_srtp_h" "$ac_includes_default"
+if test "x$ac_cv_header_srtp2_srtp_h" = xyes
+then :
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for srtp_init in -lsrtp2" >&5
+printf %s "checking for srtp_init in -lsrtp2... " >&6; }
+if test ${ac_cv_lib_srtp2_srtp_init+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_lib_save_LIBS=$LIBS
+LIBS="-lsrtp2  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char srtp_init (void);
+int
+main (void)
+{
+return srtp_init ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  ac_cv_lib_srtp2_srtp_init=yes
+else case e in #(
+  e) ac_cv_lib_srtp2_srtp_init=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS ;;
+esac
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_srtp2_srtp_init" >&5
+printf "%s\n" "$ac_cv_lib_srtp2_srtp_init" >&6; }
+if test "x$ac_cv_lib_srtp2_srtp_init" = xyes
+then :
+  HAVE_srtp2=yes
+        SRTP2_LIBS="-lsrtp2"
+else case e in #(
+  e) HAVE_srtp2=no ;;
+esac
+fi
+
+else case e in #(
+  e) HAVE_srtp2=no ;;
+esac
+fi
+
+
+  if test "x$HAVE_srtp2" = "xyes"; then
+        HAVE_mbedtls3=no
+    saved_CPPFLAGS=$CPPFLAGS
+    saved_LDFLAGS=$LDFLAGS
+    MBEDTLS3_PREFIX=
+    if test "x$BREW" != x; then
+      MBEDTLS3_PREFIX=`$BREW --prefix mbedtls@3 2>/dev/null`
+      if test -n "$MBEDTLS3_PREFIX" && test -d "$MBEDTLS3_PREFIX/include"; then
+        CPPFLAGS="-I$MBEDTLS3_PREFIX/include $CPPFLAGS"
+        LDFLAGS="-L$MBEDTLS3_PREFIX/lib $LDFLAGS"
+      fi
     fi
-  fi
-  ac_fn_c_check_header_compile "$LINENO" "mbedtls/ctr_drbg.h" "ac_cv_header_mbedtls_ctr_drbg_h" "$ac_includes_default"
+    ac_fn_c_check_header_compile "$LINENO" "mbedtls/ctr_drbg.h" "ac_cv_header_mbedtls_ctr_drbg_h" "$ac_includes_default"
 if test "x$ac_cv_header_mbedtls_ctr_drbg_h" = xyes
 then :
   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for mbedtls_ctr_drbg_seed in -lmbedcrypto" >&5
@@ -4566,17 +4628,59 @@ fi
 printf "%s\n" "$ac_cv_lib_mbedtls_mbedtls_ssl_conf_rng" >&6; }
 if test "x$ac_cv_lib_mbedtls_mbedtls_ssl_conf_rng" = xyes
 then :
-  ac_fn_c_check_header_compile "$LINENO" "srtp2/srtp.h" "ac_cv_header_srtp2_srtp_h" "$ac_includes_default"
-if test "x$ac_cv_header_srtp2_srtp_h" = xyes
+  HAVE_mbedtls3=yes
+else case e in #(
+  e) HAVE_mbedtls3=no ;;
+esac
+fi
+
+else case e in #(
+  e) HAVE_mbedtls3=no ;;
+esac
+fi
+
+else case e in #(
+  e) HAVE_mbedtls3=no ;;
+esac
+fi
+
+    if test "x$HAVE_mbedtls3" = "xyes"; then
+      MBEDTLS_CFLAGS=""
+      MBEDTLS_LIBS="-lmbedtls -lmbedx509 -lmbedcrypto"
+      if test -n "$MBEDTLS3_PREFIX"; then
+        MBEDTLS_CFLAGS="-I$MBEDTLS3_PREFIX/include"
+        MBEDTLS_LIBS="-L$MBEDTLS3_PREFIX/lib $MBEDTLS_LIBS"
+      fi
+    else
+      CPPFLAGS=$saved_CPPFLAGS
+      LDFLAGS=$saved_LDFLAGS
+    fi
+
+        HAVE_openssl=no
+    saved_CPPFLAGS=$CPPFLAGS
+    saved_LDFLAGS=$LDFLAGS
+    OPENSSL_PREFIX=
+    if test "x$BREW" != x; then
+      OPENSSL_PREFIX=`$BREW --prefix openssl@3 2>/dev/null`
+      if test -z "$OPENSSL_PREFIX"; then
+        OPENSSL_PREFIX=`$BREW --prefix openssl 2>/dev/null`
+      fi
+      if test -n "$OPENSSL_PREFIX" && test -d "$OPENSSL_PREFIX/include"; then
+        CPPFLAGS="-I$OPENSSL_PREFIX/include $CPPFLAGS"
+        LDFLAGS="-L$OPENSSL_PREFIX/lib $LDFLAGS"
+      fi
+    fi
+    ac_fn_c_check_header_compile "$LINENO" "openssl/srtp.h" "ac_cv_header_openssl_srtp_h" "$ac_includes_default"
+if test "x$ac_cv_header_openssl_srtp_h" = xyes
 then :
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for srtp_init in -lsrtp2" >&5
-printf %s "checking for srtp_init in -lsrtp2... " >&6; }
-if test ${ac_cv_lib_srtp2_srtp_init+y}
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for SSL_CTX_set_tlsext_use_srtp in -lssl" >&5
+printf %s "checking for SSL_CTX_set_tlsext_use_srtp in -lssl... " >&6; }
+if test ${ac_cv_lib_ssl_SSL_CTX_set_tlsext_use_srtp+y}
 then :
   printf %s "(cached) " >&6
 else case e in #(
   e) ac_check_lib_save_LIBS=$LIBS
-LIBS="-lsrtp2  $LIBS"
+LIBS="-lssl -lcrypto $LIBS"
 cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 
@@ -4589,20 +4693,20 @@ cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 #ifdef __cplusplus
 extern "C"
 #endif
-char srtp_init (void);
+char SSL_CTX_set_tlsext_use_srtp (void);
 int
 main (void)
 {
-return srtp_init ();
+return SSL_CTX_set_tlsext_use_srtp ();
   ;
   return 0;
 }
 _ACEOF
 if ac_fn_c_try_link "$LINENO"
 then :
-  ac_cv_lib_srtp2_srtp_init=yes
+  ac_cv_lib_ssl_SSL_CTX_set_tlsext_use_srtp=yes
 else case e in #(
-  e) ac_cv_lib_srtp2_srtp_init=no ;;
+  e) ac_cv_lib_ssl_SSL_CTX_set_tlsext_use_srtp=no ;;
 esac
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam \
@@ -4610,53 +4714,124 @@ rm -f core conftest.err conftest.$ac_objext conftest.beam \
 LIBS=$ac_check_lib_save_LIBS ;;
 esac
 fi
-{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_srtp2_srtp_init" >&5
-printf "%s\n" "$ac_cv_lib_srtp2_srtp_init" >&6; }
-if test "x$ac_cv_lib_srtp2_srtp_init" = xyes
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_ssl_SSL_CTX_set_tlsext_use_srtp" >&5
+printf "%s\n" "$ac_cv_lib_ssl_SSL_CTX_set_tlsext_use_srtp" >&6; }
+if test "x$ac_cv_lib_ssl_SSL_CTX_set_tlsext_use_srtp" = xyes
 then :
-  HAVE_dtls=yes
-                 DTLS_LIBS="$DTLS_LIBS_PREFIX -lmbedtls -lmbedx509 -lmbedcrypto -lsrtp2"
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for PEM_read_bio_X509 in -lcrypto" >&5
+printf %s "checking for PEM_read_bio_X509 in -lcrypto... " >&6; }
+if test ${ac_cv_lib_crypto_PEM_read_bio_X509+y}
+then :
+  printf %s "(cached) " >&6
 else case e in #(
-  e) HAVE_dtls=no ;;
+  e) ac_check_lib_save_LIBS=$LIBS
+LIBS="-lcrypto  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char PEM_read_bio_X509 (void);
+int
+main (void)
+{
+return PEM_read_bio_X509 ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  ac_cv_lib_crypto_PEM_read_bio_X509=yes
+else case e in #(
+  e) ac_cv_lib_crypto_PEM_read_bio_X509=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS ;;
+esac
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_crypto_PEM_read_bio_X509" >&5
+printf "%s\n" "$ac_cv_lib_crypto_PEM_read_bio_X509" >&6; }
+if test "x$ac_cv_lib_crypto_PEM_read_bio_X509" = xyes
+then :
+  HAVE_openssl=yes
+else case e in #(
+  e) HAVE_openssl=no ;;
 esac
 fi
 
 else case e in #(
-  e) HAVE_dtls=no ;;
+  e) HAVE_openssl=no ;;
 esac
 fi
 
 else case e in #(
-  e) HAVE_dtls=no ;;
+  e) HAVE_openssl=no ;;
 esac
 fi
 
-else case e in #(
-  e) HAVE_dtls=no ;;
-esac
-fi
+    if test "x$HAVE_openssl" = "xyes"; then
+      OPENSSL_CFLAGS=""
+      OPENSSL_LIBS="-lssl -lcrypto"
+      if test -n "$OPENSSL_PREFIX"; then
+        OPENSSL_CFLAGS="-I$OPENSSL_PREFIX/include"
+        OPENSSL_LIBS="-L$OPENSSL_PREFIX/lib $OPENSSL_LIBS"
+      fi
+    else
+      CPPFLAGS=$saved_CPPFLAGS
+      LDFLAGS=$saved_LDFLAGS
+    fi
 
-else case e in #(
-  e) HAVE_dtls=no ;;
-esac
-fi
+        case "$WITH_dtls" in
+      mbedtls)
+        if test "x$HAVE_mbedtls3" = "xyes"; then DTLS_BACKEND=mbedtls
+        else as_fn_error $? "--with-dtls=mbedtls but mbedtls 3.x not found" "$LINENO" 5
+        fi ;;
+      openssl)
+        if test "x$HAVE_openssl" = "xyes"; then DTLS_BACKEND=openssl
+        else as_fn_error $? "--with-dtls=openssl but OpenSSL 1.1+ not found" "$LINENO" 5
+        fi ;;
+      auto|yes)
+        if   test "x$HAVE_mbedtls3" = "xyes"; then DTLS_BACKEND=mbedtls
+        elif test "x$HAVE_openssl"  = "xyes"; then DTLS_BACKEND=openssl
+        fi ;;
+    esac
 
-  if test "x$HAVE_dtls" != "xyes"; then
-    CPPFLAGS=$saved_CPPFLAGS
-    LDFLAGS=$saved_LDFLAGS
-  fi
-
-    if test "x$HAVE_dtls" = "xyes"; then
-      VHAM_FEATURE_DEFS="$VHAM_FEATURE_DEFS -DVHAM_WITH_DTLS"
-      VHAM_FEATURE_SRCS="$VHAM_FEATURE_SRCS "
+    if test "x$DTLS_BACKEND" = "xmbedtls"; then
+      HAVE_dtls=yes
+      DTLS_CFLAGS="$MBEDTLS_CFLAGS"
+      DTLS_LIBS="$MBEDTLS_LIBS $SRTP2_LIBS"
+      VHAM_FEATURE_DEFS="$VHAM_FEATURE_DEFS -DVHAM_WITH_DTLS -DVHAM_WITH_DTLS_MBEDTLS"
+      VHAM_FEATURE_SRCS="$VHAM_FEATURE_SRCS src/srtp_mbedtls.c"
+    elif test "x$DTLS_BACKEND" = "xopenssl"; then
+      HAVE_dtls=yes
+      DTLS_CFLAGS="$OPENSSL_CFLAGS"
+      DTLS_LIBS="$OPENSSL_LIBS $SRTP2_LIBS"
+      VHAM_FEATURE_DEFS="$VHAM_FEATURE_DEFS -DVHAM_WITH_DTLS -DVHAM_WITH_DTLS_OPENSSL"
+      VHAM_FEATURE_SRCS="$VHAM_FEATURE_SRCS src/srtp_openssl.c"
     elif test "x$WITH_dtls" = "xyes"; then
-      as_fn_error $? "DTLS-SRTP (mbedtls 3 + libsrtp2) was requested but the required library wasn't found" "$LINENO" 5
+      as_fn_error $? "--with-dtls but no usable backend found" "$LINENO" 5
     fi
   fi
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether DTLS-SRTP (mbedtls 3 + libsrtp2) support is enabled" >&5
-printf %s "checking whether DTLS-SRTP (mbedtls 3 + libsrtp2) support is enabled... " >&6; }
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $HAVE_dtls" >&5
-printf "%s\n" "$HAVE_dtls" >&6; }
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether DTLS-SRTP support is enabled" >&5
+printf %s "checking whether DTLS-SRTP support is enabled... " >&6; }
+if test "x$HAVE_dtls" = "xyes"; then
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes ($DTLS_BACKEND)" >&5
+printf "%s\n" "yes ($DTLS_BACKEND)" >&6; }
+else
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+fi
 
 
 
@@ -5841,7 +6016,11 @@ echo "  CFLAGS       = $CFLAGS"
 echo "  Opus         = $HAVE_opus"
 echo "  AMR-NB/WB    = $HAVE_amr"
 echo "  iLBC         = $HAVE_ilbc"
-echo "  DTLS-SRTP    = $HAVE_dtls"
+if test "x$HAVE_dtls" = "xyes"; then
+    echo "  DTLS-SRTP    = yes ($DTLS_BACKEND)"
+else
+    echo "  DTLS-SRTP    = no"
+fi
 echo
 echo "  Run \`make\` to build."
 echo

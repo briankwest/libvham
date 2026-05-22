@@ -29,6 +29,7 @@
 
 #include "vham/cc.h"
 #include "vham/codec.h"
+#include "vham/codec_audio.h"
 #include "vham/gps.h"
 #include "vham/im.h"
 #include "vham/oam.h"
@@ -37,6 +38,10 @@
 #include "vham/passthrough.h"
 #include "vham/regreq.h"
 #include "vham/regrsp.h"
+#include "vham/rtp.h"
+#include "vham/sdp.h"
+#include "vham/voice.h"
+#include <math.h>
 #include "vham/tokenstore.h"
 
 static int usage(void) {
@@ -58,6 +63,10 @@ static int usage(void) {
 "  vham-cli im       --user U --pass P --to NUM --text \"...\"\n"
 "  vham-cli gps      --user U --pass P --lat F --lon F\n"
 "  vham-cli call     --user U --pass P --to CHANNEL_OR_NUM [--wait SEC]\n"
+"  vham-cli transmit --user U --pass P --to CHANNEL [--tone HZ] [--file PCM]\n"
+"                                                   [--seconds N] [--codec pcmu|pcma]\n"
+"                                  SETUP a call, then pump RTP. --file expects\n"
+"                                  raw 16-bit signed-PCM @ 8 kHz mono.\n"
 "  vham-cli listen   --user U --pass P [--tune CHANNEL] [--wait SEC]\n"
 "  vham-cli passthrough --user U --pass P --to NUM --code N [--type N] [--data \"...\"]\n"
 "  vham-cli mm       <profreq|modreq|routereq|accreq|nattprob> --user U --pass P\n"
@@ -152,6 +161,11 @@ typedef struct {
     int         code;
     int         type;
     const char *data;
+    /* transmit subcommand */
+    int         tone_hz;
+    int         seconds;
+    const char *file;
+    const char *codec;
 } args_t;
 
 static int parse_args(int argc, char **argv, args_t *a) {
@@ -180,6 +194,10 @@ static int parse_args(int argc, char **argv, args_t *a) {
         else if (!strcmp(k, "--code")   && v) { a->code   = atoi(v); i++; }
         else if (!strcmp(k, "--type")   && v) { a->type   = atoi(v); i++; }
         else if (!strcmp(k, "--data")   && v) { a->data   = v; i++; }
+        else if (!strcmp(k, "--tone")   && v) { a->tone_hz = atoi(v); i++; }
+        else if (!strcmp(k, "--seconds") && v) { a->seconds = atoi(v); i++; }
+        else if (!strcmp(k, "--file")   && v) { a->file   = v; i++; }
+        else if (!strcmp(k, "--codec")  && v) { a->codec  = v; i++; }
         else if (!strcmp(k, "--text")   && v) { a->text   = v; i++; }
         else if (!strcmp(k, "--tune")   && v) { a->tune   = v; i++; }
         else if (!strcmp(k, "--lat")    && v) { a->lat = atof(v); i++; }
@@ -587,13 +605,515 @@ static int cmd_call(args_t *a) {
     return 0;
 }
 
+/* ---------- transmit (login → tune → SETUP → pump RTP) ----------
+ *
+ * Bundles every step needed to push audio onto a PoC channel:
+ *   1. Login (gets media_gw from REGRSP).
+ *   2. STATUSSUBS the channel — server marks us as a participant.
+ *   3. Open a UDP socket on a local RTP port we'll advertise.
+ *   4. Send CC_SETUP with an SDP pointing at that local port.
+ *   5. Watch for ACK + CC_CONN; on CC_INFO mic-grant (sub 0x83), start
+ *      pumping RTP frames at 50 fps (20ms PCMU/PCMA) toward media_gw.
+ *   6. After `--seconds` of audio (tone or file), send CC_REL.
+ */
+static int load_pcm_file(const char *path, int16_t **out, size_t *count) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror("fopen"); return -1; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz % 2) { fclose(f); return -1; }
+    int16_t *buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); return -1; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f); return -1;
+    }
+    fclose(f);
+    *out = buf;
+    *count = (size_t)sz / 2;
+    return 0;
+}
+
+static int cmd_transmit(args_t *a) {
+    if (!a->user || !a->pass || !a->to) return usage();
+    if (!a->tone_hz && !a->file) {
+        fprintf(stderr, "transmit: need --tone HZ or --file PATH\n");
+        return 2;
+    }
+    const char *codec_name = a->codec ? a->codec : "pcmu";
+    uint8_t pt;
+    int samples_per_frame = 160;  /* 20 ms */
+    uint32_t clock_rate = 8000;
+    if      (!strcmp(codec_name, "pcmu"))   { pt = 0;  }
+    else if (!strcmp(codec_name, "pcma"))   { pt = 8;  }
+    else if (!strcmp(codec_name, "amr"))    { pt = 96; }
+    else if (!strcmp(codec_name, "amr-wb")) {
+        pt = 97; samples_per_frame = 320; clock_rate = 16000;
+    }
+    else if (!strcmp(codec_name, "ilbc"))   { pt = 102; }
+    else if (!strcmp(codec_name, "opus"))   {
+        pt = 106; samples_per_frame = 960; clock_rate = 48000;
+    }
+    else {
+        fprintf(stderr, "transmit: --codec must be pcmu/pcma/amr/amr-wb/ilbc/opus\n");
+        return 2;
+    }
+    int seconds = a->seconds ? a->seconds : 5;
+    uint32_t ip_be; uint16_t port;
+    if (parse_server(a->server, &ip_be, &port) != 0) return usage();
+
+    vham_reg_client_t cli; int sig_fd;
+    if (do_login(a->user, a->pass, ip_be, port, &sig_fd, &cli) != 0) return 1;
+    if (!cli.have_media_gw) {
+        fprintf(stderr, "transmit: REGRSP didn't include a media gateway\n");
+        close(sig_fd); return 1;
+    }
+    printf("media gateway: %u.%u.%u.%u:%u\n",
+           (cli.media_gw_ipv4 >> 24) & 0xff,
+           (cli.media_gw_ipv4 >> 16) & 0xff,
+           (cli.media_gw_ipv4 >> 8) & 0xff,
+           (cli.media_gw_ipv4) & 0xff,
+           cli.media_gw_port);
+
+    /* Step 1 — STATUSSUBS so the server tags us as the channel TX. */
+    cli.seq_no += 1;
+    uint8_t sb[256];
+    int sn = vham_build_status_subs(cli.seq_no, a->user, a->to,
+                                    VHAM_SUBS_DETAILED, 1, sb, sizeof sb);
+    if (sn > 0) send(sig_fd, sb, (size_t)sn, 0);
+    /* Drain any TAP-ACK + notify echoes. */
+    struct timeval tv = { .tv_sec = 1 };
+    setsockopt(sig_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    uint8_t resp[2048];
+    for (int g = 0; g < 3; ++g) { if (recv(sig_fd, resp, sizeof resp, 0) <= 0) break; }
+
+    /* Step 2 — open the RTP socket so we know our local port. */
+    int rtp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (rtp_fd < 0) { perror("socket"); close(sig_fd); return 1; }
+    struct sockaddr_in local = { .sin_family = AF_INET, .sin_port = 0,
+                                  .sin_addr = { .s_addr = htonl(INADDR_ANY) } };
+    if (bind(rtp_fd, (struct sockaddr *)&local, sizeof local) < 0) {
+        perror("bind"); close(rtp_fd); close(sig_fd); return 1;
+    }
+    socklen_t llen = sizeof local;
+    getsockname(rtp_fd, (struct sockaddr *)&local, &llen);
+    uint16_t rtp_port = ntohs(local.sin_port);
+    printf("local RTP port: %u\n", rtp_port);
+
+    /* Step 3 — CC_SETUP with our RTP port in the SDP. */
+    vham_sdp_t s = {
+        .origin_ipv4 = 0,         /* server fills in from packet src */
+        .media_count = 1,
+        .media = {{ .media_type = 0, .transport = 0,
+                    .ipv4 = 0, .port = rtp_port,
+                    .codec_count = 1,
+                    .codecs = {{ .payload_type = pt,
+                                 .encoding_param = 1,
+                                 .clock_rate = clock_rate }} }},
+    };
+    const char *codec_label =
+        pt == 0   ? "PCMU"   : pt == 8   ? "PCMA"   :
+        pt == 96  ? "AMR"    : pt == 97  ? "AMR-WB" :
+        pt == 102 ? "iLBC"   : pt == 106 ? "opus"   : "L16";
+    snprintf(s.media[0].codecs[0].name,
+             sizeof s.media[0].codecs[0].name, "%s", codec_label);
+    uint8_t sdp[1024];
+    int sdp_n = vham_build_sdp_body(&s, sdp, sizeof sdp);
+    if (sdp_n <= 0) { close(rtp_fd); close(sig_fd); return 1; }
+    vham_cc_call_t call;
+    /* Per com.ids.idtma.media.CSAudio:
+     *   audioHalfCall (user→user) uses leg_id=7, no subcode
+     *   audioGroupCall (channel)  uses leg_id=9, subcode="00"
+     * Auto-detect: pure-numeric peer = channel, anything else = user. */
+    int peer_numeric = 1;
+    for (const char *p = a->to; *p; ++p)
+        if (*p < '0' || *p > '9') { peer_numeric = 0; break; }
+    uint32_t leg_id = peer_numeric ? 9 : 7;
+    const char *subcode = peer_numeric ? "00" : NULL;
+    printf("call mode: %s (leg=%u, subcode=%s)\n",
+           peer_numeric ? "channel/group" : "user-to-user",
+           leg_id, subcode ? subcode : "<none>");
+    vham_cc_call_init(&call, a->user, a->to, leg_id);
+    uint8_t buf[2048];
+    int n = vham_cc_call_emit(&call, sdp, (size_t)sdp_n,
+                              VHAM_CALL_HALF_DUPLEX, subcode,
+                              cli.last_algorithm, cli.last_nonce,
+                              cli.last_realm, cli.last_response_hex,
+                              buf, sizeof buf);
+    if (n <= 0 || send(sig_fd, buf, (size_t)n, 0) != (ssize_t)n) {
+        fprintf(stderr, "CC_SETUP send failed\n");
+        close(rtp_fd); close(sig_fd); return 1;
+    }
+    printf("CC_SETUP sent (%d bytes) to %s\n", n, a->to);
+
+    /* Step 4 — wait briefly for ACK / CONN / mic-grant. Some channels
+     * grant the mic implicitly with SETUPACK; others require an
+     * explicit CC_INFO sub 0x83. We pump regardless after a short
+     * grace period. */
+    time_t grant_deadline = time(NULL) + 6;
+    int got_ack = 0, got_grant = 0;
+    uint32_t peer_media_ip = cli.media_gw_ipv4;
+    uint16_t peer_media_port = cli.media_gw_port;
+    while (time(NULL) < grant_deadline && !got_grant) {
+        ssize_t r = recv(sig_fd, resp, sizeof resp, 0);
+        if (r < 0) continue;
+        uint16_t flags = (uint16_t)((resp[2] << 8) | resp[3]);
+        uint16_t cls   = (uint16_t)((resp[8]  << 8) | resp[9]);
+        uint16_t cmd   = (uint16_t)((resp[10] << 8) | resp[11]);
+        if (flags == VHAM_TAP_FLAG_ACK) {
+            got_ack = 1;
+            printf("[rx] TAP-ACK cls=0x%04x cmd=0x%04x\n", cls, cmd);
+            continue;
+        }
+        printf("[rx] cls=0x%04x cmd=0x%04x len=%zd\n", cls, cmd, r);
+        /* The server returns the per-call media port in an MM_REGRSP
+         * notify (not in a CC_SETUPACK). Walk IEs and print every one
+         * we see, with special handling for known media-routing IEs. */
+        if (cls == VHAM_TAP_CLASS_MM && cmd == VHAM_MM_REGRSP) {
+            const uint8_t *body = resp + 32;
+            size_t blen = (size_t)r - 32;
+            size_t off = 0;
+            while (off + 4 <= blen) {
+                uint16_t tag = (uint16_t)((body[off] << 8) | body[off+1]);
+                uint16_t len = (uint16_t)((body[off+2] << 8) | body[off+3]);
+                if (off + 4 + len > blen) break;
+                /* Print every IE for debug. */
+                printf("[rx]   IE 0x%04x len=%u", tag, len);
+                if (len <= 16) {
+                    printf("  bytes:");
+                    for (uint16_t i = 0; i < len; ++i)
+                        printf(" %02x", body[off + 4 + i]);
+                } else {
+                    printf("  first16:");
+                    for (int i = 0; i < 16; ++i)
+                        printf(" %02x", body[off + 4 + i]);
+                }
+                printf("\n");
+                if ((tag == 0x005a || tag == 0x0084) && len >= 6) {
+                    /* PIpAddr — 4-byte big-endian IP + 2-byte BE port.
+                     * IE 0x5a is the default media_gw; IE 0x84 is the
+                     * "alt endpoint" the server allocates for this call. */
+                    uint32_t ip = ((uint32_t)body[off+4]  << 24)
+                                | ((uint32_t)body[off+5]  << 16)
+                                | ((uint32_t)body[off+6]  <<  8)
+                                | (uint32_t)body[off+7];
+                    uint16_t pp = (uint16_t)((body[off+8] << 8) | body[off+9]);
+                    if (tag == 0x0084 && pp != 0) {
+                        peer_media_ip = ip; peer_media_port = pp;
+                        printf("[rx]   → per-call media @ %u.%u.%u.%u:%u\n",
+                               (ip >> 24)&0xff, (ip >> 16)&0xff,
+                               (ip >>  8)&0xff,  ip       &0xff, pp);
+                        got_grant = 1;
+                    }
+                } else if (tag == 0x0019) {
+                    vham_sdp_t p;
+                    if (vham_parse_sdp_body(body + off + 4, len, &p) == 0
+                        && p.media_count > 0 && p.media[0].port) {
+                        peer_media_ip = p.media[0].ipv4
+                                          ? p.media[0].ipv4
+                                          : peer_media_ip;
+                        peer_media_port = p.media[0].port;
+                        printf("[rx]  IE 0x19 SDP media @ %u.%u.%u.%u:%u pt=%u\n",
+                               (peer_media_ip >> 24)&0xff,
+                               (peer_media_ip >> 16)&0xff,
+                               (peer_media_ip >>  8)&0xff,
+                                peer_media_ip       &0xff,
+                                peer_media_port,
+                                p.media[0].codec_count > 0
+                                  ? p.media[0].codecs[0].payload_type : 0);
+                    }
+                }
+                off += 4 + len;
+            }
+        }
+        if (cmd == VHAM_CC_SETUPACK || cmd == VHAM_CC_CONN
+            || cmd == VHAM_CC_INFO) {
+            printf("%s\n",
+                cmd == VHAM_CC_SETUPACK ? "CC_SETUPACK" :
+                cmd == VHAM_CC_CONN     ? "CC_CONN" : "CC_INFO");
+            /* Parse IE 0x19 SDP — extract per-call media destination. */
+            const uint8_t *body = resp + 32;
+            size_t blen = (size_t)r - 32;
+            size_t off = 0;
+            while (off + 4 <= blen) {
+                uint16_t tag = (uint16_t)((body[off] << 8) | body[off+1]);
+                uint16_t len = (uint16_t)((body[off+2] << 8) | body[off+3]);
+                if (off + 4 + len > blen) break;
+                if (tag == 0x0019) {
+                    vham_sdp_t p;
+                    if (vham_parse_sdp_body(body + off + 4, len, &p) == 0
+                        && p.media_count > 0 && p.media[0].port) {
+                        peer_media_ip   = p.media[0].ipv4
+                                          ? p.media[0].ipv4
+                                          : cli.media_gw_ipv4;
+                        peer_media_port = p.media[0].port;
+                        printf("[cc] server media endpoint: %u.%u.%u.%u:%u\n",
+                               (peer_media_ip >> 24)&0xff,
+                               (peer_media_ip >> 16)&0xff,
+                               (peer_media_ip >>  8)&0xff,
+                                peer_media_ip       &0xff,
+                                peer_media_port);
+                    }
+                }
+                off += 4 + len;
+            }
+            got_grant = 1;
+        }
+        else if (cmd == VHAM_CC_REL)  {
+            vham_cc_call_recv(&call, resp, (size_t)r);
+            printf("CC_REL cause=0x%x (%s)\n", call.last_cause,
+                   vham_cause_name((uint16_t)call.last_cause));
+            close(rtp_fd); close(sig_fd); return 1;
+        }
+    }
+    if (!got_ack) printf("(no TAP-ACK observed; transmitting anyway)\n");
+    /* Re-aim the RTP destination at the per-call port we just learned. */
+    cli.media_gw_ipv4 = peer_media_ip;
+    cli.media_gw_port = peer_media_port;
+
+    /* Request mic grant — channel PTT might require this before media. */
+    {
+        uint8_t mg[256];
+        int mn = vham_cc_call_mic_grant(&call, 1, mg, sizeof mg);
+        if (mn > 0) {
+            send(sig_fd, mg, (size_t)mn, 0);
+            printf("[cc] CC_INFO mic-grant request sent\n");
+            /* Wait briefly for an ack. */
+            time_t mic_dl = time(NULL) + 2;
+            while (time(NULL) < mic_dl) {
+                ssize_t r = recv(sig_fd, resp, sizeof resp, 0);
+                if (r < 0) continue;
+                uint16_t flags = (uint16_t)((resp[2] << 8) | resp[3]);
+                uint16_t cls2  = (uint16_t)((resp[8] << 8) | resp[9]);
+                uint16_t cmd2  = (uint16_t)((resp[10] << 8) | resp[11]);
+                if (flags == VHAM_TAP_FLAG_ACK) continue;
+                printf("[rx] post-mic cls=0x%04x cmd=0x%04x len=%zd\n",
+                       cls2, cmd2, r);
+                if (cmd2 == VHAM_CC_INFOACK || cmd2 == VHAM_CC_INFO) {
+                    printf("[cc] mic granted\n");
+                    break;
+                }
+                if (cmd2 == VHAM_CC_REL) {
+                    printf("[cc] CC_REL — mic denied\n");
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Step 5 — prepare audio source. */
+    int16_t *src_pcm = NULL;
+    size_t   src_n = 0;
+    if (a->file) {
+        if (load_pcm_file(a->file, &src_pcm, &src_n) != 0) {
+            fprintf(stderr, "transmit: can't load %s\n", a->file);
+            close(rtp_fd); close(sig_fd); return 1;
+        }
+        printf("loaded %zu PCM samples (%.2fs @ 8kHz) from %s\n",
+               src_n, (double)src_n / 8000.0, a->file);
+    } else {
+        src_n = (size_t)seconds * clock_rate;
+        src_pcm = malloc(src_n * sizeof *src_pcm);
+        if (!src_pcm) { close(rtp_fd); close(sig_fd); return 1; }
+        for (size_t i = 0; i < src_n; ++i)
+            src_pcm[i] = (int16_t)(0.5 * 32767.0 *
+                          sin(2.0 * M_PI * a->tone_hz
+                              * (double)i / (double)clock_rate));
+        printf("generated %d-sec %dHz tone (%zu samples @ %u Hz)\n",
+               seconds, a->tone_hz, src_n, clock_rate);
+    }
+
+    /* Step 6 — pump 160-sample (20ms) frames at 50 fps. */
+    struct sockaddr_in dst = { .sin_family = AF_INET,
+        .sin_port = htons(cli.media_gw_port),
+        .sin_addr = { .s_addr = htonl(cli.media_gw_ipv4) } };
+
+    vham_codec_init();
+    vham_voice_tx_t tx;
+    vham_voice_tx_init(&tx, pt, (uint32_t)getpid());
+    vham_voice_tx_set_mic(&tx, 1);     /* held = transmitting */
+
+    /* NAT-punch: send 5 silence frames first so our NAT mapping is
+     * established before the audio gets bridged. */
+    {
+        int16_t *silence = calloc(samples_per_frame, sizeof *silence);
+        uint8_t pkt[2048];
+        if (silence) {
+            for (int k = 0; k < 5; ++k) {
+                int pn = vham_voice_tx_pcm_frame(&tx, silence,
+                                                 (size_t)samples_per_frame,
+                                                 k == 0 ? 1 : 0,
+                                                 pkt, sizeof pkt);
+                if (pn > 0)
+                    sendto(rtp_fd, pkt, (size_t)pn, 0,
+                           (struct sockaddr *)&dst, sizeof dst);
+                usleep(20*1000);
+            }
+            free(silence);
+        }
+        printf("[rtp] NAT-punch (5 silence frames) → media_gw (%u.%u.%u.%u:%u)\n",
+               (cli.media_gw_ipv4 >> 24)&0xff,
+               (cli.media_gw_ipv4 >> 16)&0xff,
+               (cli.media_gw_ipv4 >>  8)&0xff,
+                cli.media_gw_ipv4       &0xff,
+                cli.media_gw_port);
+    }
+
+    size_t frames = src_n / (size_t)samples_per_frame;
+    size_t sent_ok = 0;
+    uint8_t pkt[1500];
+    struct timeval frame_t;
+    gettimeofday(&frame_t, NULL);
+    uint64_t next_us = (uint64_t)frame_t.tv_sec * 1000000 + frame_t.tv_usec;
+    for (size_t i = 0; i < frames; ++i) {
+        int pn = vham_voice_tx_pcm_frame(&tx,
+                                         src_pcm + i * samples_per_frame,
+                                         (size_t)samples_per_frame,
+                                         i == 0 ? 1 : 0,
+                                         pkt, sizeof pkt);
+        if (pn > 0) {
+            if (sendto(rtp_fd, pkt, (size_t)pn, 0,
+                       (struct sockaddr *)&dst, sizeof dst) > 0) sent_ok++;
+        }
+        /* drain any signaling activity without blocking */
+        ssize_t r = recv(sig_fd, resp, sizeof resp, MSG_DONTWAIT);
+        if (r > 0) {
+            uint16_t cmd = (uint16_t)((resp[10] << 8) | resp[11]);
+            if (cmd == VHAM_CC_REL) {
+                printf("server CC_REL during TX — stopping\n");
+                break;
+            }
+        }
+        /* 20ms pacing */
+        next_us += 20000;
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        uint64_t now_us = (uint64_t)now.tv_sec * 1000000 + now.tv_usec;
+        if (next_us > now_us) usleep((useconds_t)(next_us - now_us));
+    }
+    free(src_pcm);
+    printf("sent %zu/%zu RTP frames\n", sent_ok, frames);
+
+    /* Step 7 — release the call. */
+    cli.seq_no += 1;
+    int rn = vham_cc_call_release(&call, 0x0000, buf, sizeof buf);
+    if (rn > 0) send(sig_fd, buf, (size_t)rn, 0);
+    close(rtp_fd);
+    close(sig_fd);
+    return 0;
+}
+
+/* Build a CC_CONN frame to auto-answer an incoming CC_SETUP.
+ *
+ * The server sent us a CC_SETUP (class=3, cmd=0x50) with its own
+ * dwSrcFsmId in the SRVMSG. We echo that as our dwDstFsmId so the
+ * server can correlate the answer with the call leg.
+ *
+ * Mirrors CCFsm::UserAnswer @ 0x2efa6c. */
+static int build_cc_conn_answer(const uint8_t *setup, size_t setup_len,
+                                uint32_t our_leg,
+                                const uint8_t *sdp, size_t sdp_len,
+                                uint8_t *out, size_t out_cap) {
+    if (setup_len < 32 || !out) return -1;
+
+    /* Pull server's leg from the SETUP's SRVMSG.dwSrcFsmId (bytes 24..27). */
+    uint32_t server_leg = ((uint32_t)setup[24] << 24) | ((uint32_t)setup[25] << 16)
+                        | ((uint32_t)setup[26] <<  8) | (uint32_t)setup[27];
+    /* And echo their TAP seq number. */
+    uint32_t seq = ((uint32_t)setup[4] << 24) | ((uint32_t)setup[5] << 16)
+                 | ((uint32_t)setup[6] <<  8) | (uint32_t)setup[7];
+
+    vham_buf_t b;
+    vham_buf_init(&b, out, out_cap);
+
+    /* TAP header */
+    if (vham_pack_u8 (&b, 0x01)) return -1;
+    if (vham_pack_u8 (&b, 0x00)) return -1;
+    if (vham_pack_u16(&b, VHAM_TAP_FLAG_NORMAL)) return -1;
+    if (vham_pack_u32(&b, seq + 1)) return -1;
+    if (vham_pack_u16(&b, VHAM_TAP_CLASS_CC)) return -1;
+    if (vham_pack_u16(&b, VHAM_CC_CONN)) return -1;
+    size_t tap_len_off = b.off;
+    if (vham_pack_u32(&b, 0)) return -1;
+    size_t body_start = b.off;
+
+    /* SRVMSG header: dwDstFsmId = server's leg, dwSrcFsmId = ours */
+    vham_srvmsg_hdr_t sh = {
+        .ucDst = VHAM_MOD_MM, .ucSrc = VHAM_MOD_MM,
+        .wMsgId = VHAM_CC_CONN,
+        .dwDstFsmId = server_leg,
+        .dwSrcFsmId = our_leg,
+    };
+    size_t srv_len_off;
+    if (vham_pack_srvmsg_header(&b, &sh, &srv_len_off)) return -1;
+    size_t srv_body_start = b.off;
+
+    /* IE 0x19 (SDP body). */
+    if (sdp && sdp_len > 0) {
+        if (vham_pack_u16(&b, 0x0019)) return -1;
+        if (vham_pack_u16(&b, (uint16_t)sdp_len)) return -1;
+        for (size_t i = 0; i < sdp_len; ++i)
+            if (vham_pack_u8(&b, sdp[i])) return -1;
+    }
+
+    if (vham_patch_srvmsg_len(&b, srv_len_off, srv_body_start)) return -1;
+    uint32_t tap_body = (uint32_t)(b.off - body_start);
+    b.buf[tap_len_off    ] = (uint8_t)(tap_body >> 24);
+    b.buf[tap_len_off + 1] = (uint8_t)(tap_body >> 16);
+    b.buf[tap_len_off + 2] = (uint8_t)(tap_body >>  8);
+    b.buf[tap_len_off + 3] = (uint8_t)(tap_body);
+    if (b.err) return -1;
+    return (int)b.off;
+}
+
 /* ---------- listen (wait briefly for an incoming call) ---------- */
 static int cmd_listen(args_t *a) {
     if (!a->user || !a->pass) return usage();
     uint32_t ip_be; uint16_t port;
     if (parse_server(a->server, &ip_be, &port) != 0) return usage();
-    vham_reg_client_t cli; int fd;
-    if (do_login(a->user, a->pass, ip_be, port, &fd, &cli) != 0) return 1;
+    vham_reg_client_t cli; int sig_fd;
+    if (do_login(a->user, a->pass, ip_be, port, &sig_fd, &cli) != 0) return 1;
+
+    /* Open an RTP socket so we can count incoming media. */
+    int rtp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in lo = { .sin_family = AF_INET, .sin_port = 0,
+                              .sin_addr = { .s_addr = htonl(INADDR_ANY) } };
+    bind(rtp_fd, (struct sockaddr *)&lo, sizeof lo);
+    socklen_t llen = sizeof lo;
+    getsockname(rtp_fd, (struct sockaddr *)&lo, &llen);
+    uint16_t rtp_port = ntohs(lo.sin_port);
+    /* Discover our PUBLIC IP. The server sees us via NAT, so the
+     * SDP needs the post-NAT address. Use ifconfig.me as a STUN-ish
+     * fallback (LinkPoon's client uses something similar internally). */
+    uint32_t local_ip_host = 0;
+    {
+        FILE *p = popen("curl -s --max-time 4 -4 https://ifconfig.me 2>/dev/null", "r");
+        if (p) {
+            char ipstr[64] = {0};
+            if (fgets(ipstr, sizeof ipstr, p)) {
+                struct in_addr a;
+                if (inet_aton(ipstr, &a))
+                    local_ip_host = ntohl(a.s_addr);
+            }
+            pclose(p);
+        }
+        if (local_ip_host == 0) {
+            /* Fallback: outbound interface IP (LAN). */
+            int probe = socket(AF_INET, SOCK_DGRAM, 0);
+            struct sockaddr_in srv = { .sin_family = AF_INET,
+                .sin_port = htons(port), .sin_addr.s_addr = ip_be };
+            if (connect(probe, (struct sockaddr *)&srv, sizeof srv) == 0) {
+                struct sockaddr_in me; socklen_t ml = sizeof me;
+                if (getsockname(probe, (struct sockaddr *)&me, &ml) == 0)
+                    local_ip_host = ntohl(me.sin_addr.s_addr);
+            }
+            close(probe);
+        }
+    }
+    printf("listening on RTP port %u  (advertising IP %u.%u.%u.%u)\n",
+           rtp_port,
+           (local_ip_host >> 24) & 0xff, (local_ip_host >> 16) & 0xff,
+           (local_ip_host >>  8) & 0xff,  local_ip_host        & 0xff);
 
     /* Subscribe to "###" plus optionally an explicit channel. */
     const char *targets[2] = { "###", a->tune };
@@ -603,19 +1123,55 @@ static int cmd_listen(args_t *a) {
         uint8_t sb[256];
         int sn = vham_build_status_subs(cli.seq_no, a->user, targets[i],
                                         VHAM_SUBS_DETAILED, 1, sb, sizeof sb);
-        if (sn > 0) send(fd, sb, (size_t)sn, 0);
+        if (sn > 0) send(sig_fd, sb, (size_t)sn, 0);
     }
     printf("listening as %s on %s%s for %ds...\n",
            a->user, a->tune ? "channel " : "###",
            a->tune ? a->tune : "", a->wait_sec ? a->wait_sec : 30);
 
     int wait_s = a->wait_sec ? a->wait_sec : 30;
-    struct timeval tv = { .tv_sec = 1 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct timeval sig_tv = { .tv_usec = 100*1000 };   /* 100 ms */
+    setsockopt(sig_fd, SOL_SOCKET, SO_RCVTIMEO, &sig_tv, sizeof sig_tv);
+    setsockopt(rtp_fd, SOL_SOCKET, SO_RCVTIMEO, &sig_tv, sizeof sig_tv);
     time_t deadline = time(NULL) + wait_s;
     uint8_t resp[2048];
+    int rtp_rx_count = 0;
+    vham_cc_call_t call;
+    vham_cc_call_init(&call, a->user, "", 0);
+    int answered = 0;
+    time_t last_keepalive = 0;
+    uint16_t ka_seq = 0;
     while (time(NULL) < deadline) {
-        ssize_t r = recv(fd, resp, sizeof resp, 0);
+        /* Periodic NAT-punch keepalive to media gateway (every 5s). */
+        if (cli.have_media_gw && time(NULL) - last_keepalive >= 5) {
+            last_keepalive = time(NULL);
+            struct sockaddr_in mg = { .sin_family = AF_INET,
+                .sin_port = htons(cli.media_gw_port),
+                .sin_addr = { .s_addr = htonl(cli.media_gw_ipv4) } };
+            uint8_t ka[172];
+            memset(ka, 0xff, sizeof ka);
+            ka[0] = 0x80; ka[1] = 0;
+            ka[2] = (uint8_t)(ka_seq >> 8); ka[3] = (uint8_t)ka_seq; ka_seq++;
+            ka[4] = ka[5] = ka[6] = ka[7] = 0;
+            ka[8] = ka[9] = ka[10] = 0; ka[11] = 0x01;
+            sendto(rtp_fd, ka, sizeof ka, 0, (struct sockaddr *)&mg, sizeof mg);
+        }
+        /* Poll RTP socket first — accumulate audio packets. */
+        ssize_t rr = recv(rtp_fd, resp, sizeof resp, MSG_DONTWAIT);
+        if (rr > 12) {
+            rtp_rx_count++;
+            if (rtp_rx_count == 1) {
+                uint8_t pt = resp[1] & 0x7f;
+                uint16_t seq = (uint16_t)((resp[2] << 8) | resp[3]);
+                printf("[rtp] FIRST PACKET pt=%u seq=%u len=%zd\n",
+                       pt, seq, rr);
+            } else if (rtp_rx_count % 50 == 0) {
+                printf("[rtp] received %d packets so far\n", rtp_rx_count);
+            }
+        }
+
+        /* Then signaling. */
+        ssize_t r = recv(sig_fd, resp, sizeof resp, 0);
         if (r < 0) continue;
         uint16_t flags = (uint16_t)((resp[2] << 8) | resp[3]);
         if (flags == VHAM_TAP_FLAG_ACK) continue;
@@ -629,7 +1185,110 @@ static int cmd_listen(args_t *a) {
                        n.sub_opcode, n.notify_status, n.echoed_num);
             }
         } else if (cls == VHAM_TAP_CLASS_CC && cmd == VHAM_CC_SETUP) {
-            printf("incoming CC_SETUP\n");
+            /* Walk IEs in the SETUP body to find IE 0x19 (SDP). The
+             * server's SDP tells us where the PER-CALL media gateway
+             * port is (different from the REGRSP media_gw_port). */
+            uint32_t peer_ip   = 0;
+            uint16_t peer_port = 0;
+            uint8_t  peer_pt   = 0;
+            const uint8_t *body = resp + 32;
+            size_t blen = (size_t)r - 32;
+            size_t off = 0;
+            while (off + 4 <= blen) {
+                uint16_t tag = (uint16_t)((body[off] << 8) | body[off+1]);
+                uint16_t len = (uint16_t)((body[off+2] << 8) | body[off+3]);
+                if (off + 4 + len > blen) break;
+                if (tag == 0x0019) {
+                    vham_sdp_t p;
+                    if (vham_parse_sdp_body(body + off + 4, len, &p) == 0
+                        && p.media_count > 0) {
+                        peer_ip   = p.media[0].ipv4;
+                        peer_port = p.media[0].port;
+                        if (p.media[0].codec_count > 0)
+                            peer_pt = p.media[0].codecs[0].payload_type;
+                        printf("[cc] incoming SETUP — peer media %u.%u.%u.%u:%u pt=%u\n",
+                               (peer_ip >> 24)&0xff, (peer_ip >> 16)&0xff,
+                               (peer_ip >>  8)&0xff,  peer_ip       &0xff,
+                               peer_port, peer_pt);
+                    }
+                }
+                off += 4 + len;
+            }
+            printf("[cc] answering with CC_CONN\n");
+            /* NAT-punch the PER-CALL port we just learned about. */
+            if (peer_ip && peer_port) {
+                struct sockaddr_in dst = { .sin_family = AF_INET,
+                    .sin_port = htons(peer_port),
+                    .sin_addr = { .s_addr = htonl(peer_ip) } };
+                uint8_t silence[172];
+                memset(silence, 0xff, sizeof silence);
+                silence[0] = 0x80; silence[1] = peer_pt ? peer_pt : 0;
+                for (int k = 0; k < 5; ++k) {
+                    silence[3] = (uint8_t)k;
+                    sendto(rtp_fd, silence, sizeof silence, 0,
+                           (struct sockaddr *)&dst, sizeof dst);
+                    usleep(20*1000);
+                }
+                printf("[rtp] punched per-call port %u:%u pt=%u\n",
+                       peer_ip, peer_port, peer_pt);
+                /* Remember for the keepalive loop */
+                cli.media_gw_ipv4 = peer_ip;
+                cli.media_gw_port = peer_port;
+            }
+            /* Build a tiny SDP advertising our rtp_port for RX. */
+            vham_sdp_t s = {
+                .origin_ipv4 = local_ip_host,
+                .origin_port = rtp_port,
+                .media_count = 1,
+                .media = {{ .media_type = 0, .transport = 0,
+                            .ipv4 = local_ip_host, .port = rtp_port,
+                            .codec_count = 1,
+                            .codecs = {{ .payload_type = 0,
+                                         .encoding_param = 1,
+                                         .clock_rate = 8000 }} }} };
+            snprintf(s.media[0].codecs[0].name,
+                     sizeof s.media[0].codecs[0].name, "PCMU");
+            uint8_t sdp[512];
+            int sdp_n = vham_build_sdp_body(&s, sdp, sizeof sdp);
+            if (sdp_n > 0) {
+                uint8_t conn[2048];
+                /* Use leg=7 for user-to-user, 9 for group. We default to 7
+                 * since the listener typically answers user-to-user calls. */
+                int cn = build_cc_conn_answer(resp, (size_t)r, 7,
+                                              sdp, (size_t)sdp_n,
+                                              conn, sizeof conn);
+                if (cn > 0) {
+                    send(sig_fd, conn, (size_t)cn, 0);
+                    printf("[cc] CC_CONN sent (%d bytes)\n", cn);
+                    /* Start NAT-punching the media gateway so RTP can
+                     * reach us — send 5 silence frames. */
+                    if (cli.have_media_gw) {
+                        struct sockaddr_in mg = { .sin_family = AF_INET,
+                            .sin_port = htons(cli.media_gw_port),
+                            .sin_addr = { .s_addr = htonl(cli.media_gw_ipv4) } };
+                        uint8_t silence[172];
+                        memset(silence, 0xff, sizeof silence);   /* µ-law silence */
+                        silence[0] = 0x80; silence[1] = 0;       /* RTP hdr V=2 PT=0 */
+                        silence[2] = 0; silence[3] = 0;          /* seq */
+                        silence[4] = 0; silence[5] = 0;          /* ts hi */
+                        silence[6] = 0; silence[7] = 0;          /* ts lo */
+                        silence[8] = 0; silence[9] = 0;
+                        silence[10] = 0; silence[11] = 1;        /* SSRC */
+                        for (int k = 0; k < 5; ++k) {
+                            silence[3] = (uint8_t)k;
+                            sendto(rtp_fd, silence, sizeof silence, 0,
+                                   (struct sockaddr *)&mg, sizeof mg);
+                            usleep(20*1000);
+                        }
+                        printf("[rtp] sent 5 NAT-punch silence frames to media_gw\n");
+                    }
+                }
+                (void)call; (void)answered;
+            }
+        } else if (cls == VHAM_TAP_CLASS_CC && cmd == VHAM_CC_INFO) {
+            printf("[cc] incoming INFO (mic grant)\n");
+        } else if (cls == VHAM_TAP_CLASS_CC && cmd == VHAM_CC_REL) {
+            printf("[cc] incoming REL (call ended)\n");
         } else if (cls == VHAM_TAP_CLASS_MM && cmd == VHAM_MM_PASSTHROUGH) {
             vham_passthrough_t p;
             if (vham_parse_passthrough(resp, (size_t)r, &p) == 0)
@@ -639,7 +1298,10 @@ static int cmd_listen(args_t *a) {
             printf("rx cls=0x%04x cmd=0x%04x len=%zd\n", cls, cmd, r);
         }
     }
-    close(fd);
+    printf("\n=== summary: %d RTP packets received during listen ===\n",
+           rtp_rx_count);
+    close(rtp_fd);
+    close(sig_fd);
     return 0;
 }
 
@@ -844,6 +1506,7 @@ int main(int argc, char **argv) {
     if (!strcmp(sub, "gmodifyu")) return cmd_gmodifyu(&a);
     if (!strcmp(sub, "logout"))   return cmd_logout(&a);
     if (!strcmp(sub, "call"))     return cmd_call(&a);
+    if (!strcmp(sub, "transmit")) return cmd_transmit(&a);
     if (!strcmp(sub, "listen"))   return cmd_listen(&a);
     if (!strcmp(sub, "passthrough")) return cmd_passthrough(&a);
     if (!strcmp(sub, "token"))    return cmd_token(&a, token_action);

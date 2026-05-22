@@ -105,44 +105,142 @@ VHAM_OPTIONAL_DEP([ilbc], [iLBC codec (PT 102)], [
     [HAVE_ilbc=no])
 ], [src/codec_ilbc.c])
 
-dnl -- DTLS-SRTP (mbedtls 3 + libsrtp2) -------------------------------
+dnl -- DTLS-SRTP backend selection -------------------------------------
 dnl
-dnl mbedtls 4.x removed mbedtls_ssl_conf_rng / ctr_drbg.h / entropy.h —
-dnl all of which our DTLS code uses. We must use the v3 API. On macOS
-dnl that's `brew install mbedtls@3`; check for the v3-specific symbol
-dnl to be sure we got the right one.
+dnl Two interchangeable backends:
+dnl   mbedtls 3.x  (smaller, embedded-friendly; not 4.x — see below)
+dnl   OpenSSL 1.1+ (already installed everywhere)
+dnl
+dnl Both implement RFC 5764 + AES_CM_128_HMAC_SHA1_80 against libsrtp2.
+dnl libsrtp2 is required either way.
+dnl
+dnl Override the picker via --with-dtls=mbedtls / --with-dtls=openssl
+dnl / --with-dtls=auto (default) / --without-dtls.
+
+AC_ARG_WITH([dtls],
+  [AS_HELP_STRING([--with-dtls=auto|mbedtls|openssl|no],
+    [DTLS-SRTP backend (default: auto, prefers mbedtls when both present)])],
+  [WITH_dtls=$withval],
+  [WITH_dtls=auto])
+
 HAVE_dtls=no
-VHAM_OPTIONAL_DEP([dtls], [DTLS-SRTP (mbedtls 3 + libsrtp2)], [
-  saved_CPPFLAGS=$CPPFLAGS
-  saved_LDFLAGS=$LDFLAGS
-  if test "x$BREW" != x; then
-    MBEDTLS3_PREFIX=`$BREW --prefix mbedtls@3 2>/dev/null`
-    if test -n "$MBEDTLS3_PREFIX" && test -d "$MBEDTLS3_PREFIX/include"; then
-      AC_MSG_NOTICE([found mbedtls@3 at $MBEDTLS3_PREFIX])
-      CPPFLAGS="-I$MBEDTLS3_PREFIX/include $CPPFLAGS"
-      LDFLAGS="-L$MBEDTLS3_PREFIX/lib $LDFLAGS"
-      DTLS_CFLAGS="-I$MBEDTLS3_PREFIX/include"
-      DTLS_LIBS_PREFIX="-L$MBEDTLS3_PREFIX/lib"
+DTLS_BACKEND=none
+
+if test "x$WITH_dtls" != "xno"; then
+  dnl libsrtp2 is shared — probe once.
+  HAVE_srtp2=no
+  AC_CHECK_HEADER([srtp2/srtp.h],
+    [AC_CHECK_LIB([srtp2], [srtp_init],
+       [HAVE_srtp2=yes
+        SRTP2_LIBS="-lsrtp2"], [HAVE_srtp2=no])],
+    [HAVE_srtp2=no])
+
+  if test "x$HAVE_srtp2" = "xyes"; then
+    dnl ---- mbedtls 3.x probe (v4 removed ctr_drbg + ssl_conf_rng) ----
+    HAVE_mbedtls3=no
+    saved_CPPFLAGS=$CPPFLAGS
+    saved_LDFLAGS=$LDFLAGS
+    MBEDTLS3_PREFIX=
+    if test "x$BREW" != x; then
+      MBEDTLS3_PREFIX=`$BREW --prefix mbedtls@3 2>/dev/null`
+      if test -n "$MBEDTLS3_PREFIX" && test -d "$MBEDTLS3_PREFIX/include"; then
+        CPPFLAGS="-I$MBEDTLS3_PREFIX/include $CPPFLAGS"
+        LDFLAGS="-L$MBEDTLS3_PREFIX/lib $LDFLAGS"
+      fi
+    fi
+    AC_CHECK_HEADER([mbedtls/ctr_drbg.h],
+      [AC_CHECK_LIB([mbedcrypto], [mbedtls_ctr_drbg_seed],
+         [AC_CHECK_LIB([mbedtls], [mbedtls_ssl_conf_rng],
+            [HAVE_mbedtls3=yes],
+            [HAVE_mbedtls3=no],
+            [-lmbedx509 -lmbedcrypto])],
+         [HAVE_mbedtls3=no])],
+      [HAVE_mbedtls3=no])
+    if test "x$HAVE_mbedtls3" = "xyes"; then
+      MBEDTLS_CFLAGS=""
+      MBEDTLS_LIBS="-lmbedtls -lmbedx509 -lmbedcrypto"
+      if test -n "$MBEDTLS3_PREFIX"; then
+        MBEDTLS_CFLAGS="-I$MBEDTLS3_PREFIX/include"
+        MBEDTLS_LIBS="-L$MBEDTLS3_PREFIX/lib $MBEDTLS_LIBS"
+      fi
+    else
+      CPPFLAGS=$saved_CPPFLAGS
+      LDFLAGS=$saved_LDFLAGS
+    fi
+
+    dnl ---- OpenSSL probe ------------------------------------------
+    HAVE_openssl=no
+    saved_CPPFLAGS=$CPPFLAGS
+    saved_LDFLAGS=$LDFLAGS
+    OPENSSL_PREFIX=
+    if test "x$BREW" != x; then
+      OPENSSL_PREFIX=`$BREW --prefix openssl@3 2>/dev/null`
+      if test -z "$OPENSSL_PREFIX"; then
+        OPENSSL_PREFIX=`$BREW --prefix openssl 2>/dev/null`
+      fi
+      if test -n "$OPENSSL_PREFIX" && test -d "$OPENSSL_PREFIX/include"; then
+        CPPFLAGS="-I$OPENSSL_PREFIX/include $CPPFLAGS"
+        LDFLAGS="-L$OPENSSL_PREFIX/lib $LDFLAGS"
+      fi
+    fi
+    AC_CHECK_HEADER([openssl/srtp.h],
+      [AC_CHECK_LIB([ssl], [SSL_CTX_set_tlsext_use_srtp],
+         [AC_CHECK_LIB([crypto], [PEM_read_bio_X509],
+            [HAVE_openssl=yes], [HAVE_openssl=no])],
+         [HAVE_openssl=no],
+         [-lcrypto])],
+      [HAVE_openssl=no])
+    if test "x$HAVE_openssl" = "xyes"; then
+      OPENSSL_CFLAGS=""
+      OPENSSL_LIBS="-lssl -lcrypto"
+      if test -n "$OPENSSL_PREFIX"; then
+        OPENSSL_CFLAGS="-I$OPENSSL_PREFIX/include"
+        OPENSSL_LIBS="-L$OPENSSL_PREFIX/lib $OPENSSL_LIBS"
+      fi
+    else
+      CPPFLAGS=$saved_CPPFLAGS
+      LDFLAGS=$saved_LDFLAGS
+    fi
+
+    dnl ---- backend pick -------------------------------------------
+    case "$WITH_dtls" in
+      mbedtls)
+        if test "x$HAVE_mbedtls3" = "xyes"; then DTLS_BACKEND=mbedtls
+        else AC_MSG_ERROR([--with-dtls=mbedtls but mbedtls 3.x not found])
+        fi ;;
+      openssl)
+        if test "x$HAVE_openssl" = "xyes"; then DTLS_BACKEND=openssl
+        else AC_MSG_ERROR([--with-dtls=openssl but OpenSSL 1.1+ not found])
+        fi ;;
+      auto|yes)
+        if   test "x$HAVE_mbedtls3" = "xyes"; then DTLS_BACKEND=mbedtls
+        elif test "x$HAVE_openssl"  = "xyes"; then DTLS_BACKEND=openssl
+        fi ;;
+    esac
+
+    if test "x$DTLS_BACKEND" = "xmbedtls"; then
+      HAVE_dtls=yes
+      DTLS_CFLAGS="$MBEDTLS_CFLAGS"
+      DTLS_LIBS="$MBEDTLS_LIBS $SRTP2_LIBS"
+      VHAM_FEATURE_DEFS="$VHAM_FEATURE_DEFS -DVHAM_WITH_DTLS -DVHAM_WITH_DTLS_MBEDTLS"
+      VHAM_FEATURE_SRCS="$VHAM_FEATURE_SRCS src/srtp_mbedtls.c"
+    elif test "x$DTLS_BACKEND" = "xopenssl"; then
+      HAVE_dtls=yes
+      DTLS_CFLAGS="$OPENSSL_CFLAGS"
+      DTLS_LIBS="$OPENSSL_LIBS $SRTP2_LIBS"
+      VHAM_FEATURE_DEFS="$VHAM_FEATURE_DEFS -DVHAM_WITH_DTLS -DVHAM_WITH_DTLS_OPENSSL"
+      VHAM_FEATURE_SRCS="$VHAM_FEATURE_SRCS src/srtp_openssl.c"
+    elif test "x$WITH_dtls" = "xyes"; then
+      AC_MSG_ERROR([--with-dtls but no usable backend found])
     fi
   fi
-  AC_CHECK_HEADER([mbedtls/ctr_drbg.h],
-    [AC_CHECK_LIB([mbedcrypto], [mbedtls_ctr_drbg_seed],
-       [AC_CHECK_LIB([mbedtls], [mbedtls_ssl_conf_rng],
-          [AC_CHECK_HEADER([srtp2/srtp.h],
-             [AC_CHECK_LIB([srtp2], [srtp_init],
-                [HAVE_dtls=yes
-                 DTLS_LIBS="$DTLS_LIBS_PREFIX -lmbedtls -lmbedx509 -lmbedcrypto -lsrtp2"],
-                [HAVE_dtls=no])],
-             [HAVE_dtls=no])],
-          [HAVE_dtls=no],
-          [-lmbedx509 -lmbedcrypto])],
-       [HAVE_dtls=no])],
-    [HAVE_dtls=no])
-  if test "x$HAVE_dtls" != "xyes"; then
-    CPPFLAGS=$saved_CPPFLAGS
-    LDFLAGS=$saved_LDFLAGS
-  fi
-], [])dnl DTLS source lives in src/srtp.c (always compiled — guarded by #ifdef)
+fi
+AC_MSG_CHECKING([whether DTLS-SRTP support is enabled])
+if test "x$HAVE_dtls" = "xyes"; then
+  AC_MSG_RESULT([yes ($DTLS_BACKEND)])
+else
+  AC_MSG_RESULT([no])
+fi
 
 dnl --- expose to Makefile -----------------------------------------------
 AC_SUBST([VHAM_FEATURE_DEFS])
@@ -175,7 +273,11 @@ echo "  CFLAGS       = $CFLAGS"
 echo "  Opus         = $HAVE_opus"
 echo "  AMR-NB/WB    = $HAVE_amr"
 echo "  iLBC         = $HAVE_ilbc"
-echo "  DTLS-SRTP    = $HAVE_dtls"
+if test "x$HAVE_dtls" = "xyes"; then
+    echo "  DTLS-SRTP    = yes ($DTLS_BACKEND)"
+else
+    echo "  DTLS-SRTP    = no"
+fi
 echo
 echo "  Run \`make\` to build."
 echo

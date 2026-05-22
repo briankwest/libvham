@@ -78,7 +78,7 @@ make test       # runs the 82-test offline suite
 | `libopus` | Opus codec (PT 106) | `pkg-config opus` → fallback `AC_CHECK_LIB` |
 | `libopencore-amrnb` + `libopencore-amrwb` + `libvo-amrwbenc` | AMR-NB (PT 96) + AMR-WB (PT 97) | header + symbol probe |
 | `libilbc` (WebRTC iLBC) | iLBC 20ms (PT 102) | header + symbol probe |
-| `mbedtls` 3.x + `libsrtp2` | DTLS-SRTP (AES_CM_128_HMAC_SHA1_80) | header + symbol probe; mbedtls 4 rejected because it removed `mbedtls_ssl_conf_rng` |
+| `mbedtls` 3.x **or** OpenSSL 1.1+ — both with `libsrtp2` | DTLS-SRTP (AES_CM_128_HMAC_SHA1_80) | Two interchangeable backends. `--with-dtls=auto` (default) prefers mbedtls; `--with-dtls=openssl` forces OpenSSL. mbedtls 4.x is rejected (it removed `mbedtls_ssl_conf_rng`). |
 
 After `./configure`:
 
@@ -97,6 +97,8 @@ After `./configure`:
 ```sh
 ./configure --without-opus
 ./configure --without-dtls
+./configure --with-dtls=openssl       # use OpenSSL instead of mbedtls
+./configure --with-dtls=mbedtls       # explicit (default when both present)
 ./configure --with-amr=no             # same as --without-amr
 ./configure CC=clang CFLAGS="-O3 -march=native"
 ./configure --without-opus --without-amr --without-ilbc --without-dtls   # minimal G.711-only
@@ -107,8 +109,12 @@ After `./configure`:
 ### macOS via Homebrew
 
 ```sh
-brew install opus opencore-amr vo-amrwbenc libilbc mbedtls@3 libsrtp
-./configure
+brew install opus opencore-amr vo-amrwbenc libilbc libsrtp mbedtls@3
+# OR for OpenSSL backend (already installed by default on most systems):
+brew install opus opencore-amr vo-amrwbenc libilbc libsrtp openssl@3
+
+./configure                       # auto picks whichever DTLS backend is installed
+./configure --with-dtls=openssl   # force OpenSSL if both available
 make
 ```
 
@@ -278,7 +284,7 @@ VHAM_GROUP=
 - **Jitter buffer** — recenter-on-early, configurable depth
 - **DTMF** — RFC 4733 (PT 101)
 - **H.264** — FU-A packetization, NALU parsing
-- **DTLS-SRTP** — mbedtls 3 handshake (virtual transport) + libsrtp 2 cipher (AES_CM_128_HMAC_SHA1_80)
+- **DTLS-SRTP** — pluggable backend (mbedtls 3 *or* OpenSSL 1.1+) with virtual transport, RFC 5764 key derivation via RFC 5705, libsrtp 2 cipher (AES_CM_128_HMAC_SHA1_80). Choose at configure time with `--with-dtls=mbedtls|openssl|auto|no`.
 - **Segmentation + retx** — for large composite frames over UDP
 
 #### Composite IEs (TLV bodies)
@@ -388,7 +394,9 @@ src/                  implementation
   codec_opus.c          (built when WITH_OPUS)
   codec_amr.c           (built when WITH_AMR)
   codec_ilbc.c          (built when WITH_ILBC)
-  srtp.c                DTLS-SRTP via mbedtls + libsrtp
+  srtp.c                DTLS-SRTP dispatcher / stub
+  srtp_mbedtls.c        DTLS-SRTP backend — mbedtls 3 (built when --with-dtls=mbedtls)
+  srtp_openssl.c        DTLS-SRTP backend — OpenSSL 1.1+ (built when --with-dtls=openssl)
   h264.c                FU-A
   account.c             region prefix / silent-activation
   tokenstore.c          on-disk token cache
