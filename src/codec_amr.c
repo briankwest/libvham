@@ -73,7 +73,17 @@ static int amrwb_enc(vham_audio_codec_t *c,
                      uint8_t *out, size_t out_cap) {
     amrwb_state_t *s = (amrwb_state_t *)c->state;
     if (!s || !s->enc || n_samples != 320 || out_cap < 61) return -1;
-    /* Mode 8 = 23.85 kbps, max quality. */
+    /* Mode 8 = 23.85 kbps, max quality.
+     *
+     * NB: E_IF_encode writes 3GPP TS 26.201 §A.2 IF1 storage format
+     * (one header byte + speech). That isn't a valid RTP payload —
+     * RFC 4867 §4.3 (bandwidth-efficient) or §4.4 (octet-aligned)
+     * rearranges the same bits into a CMR + ToC + speech layout.
+     *
+     * Today this is fine for offline round-trip tests (encode →
+     * decode in the same lib), but for wire interop a 50-LOC
+     * IF1 → octet-aligned wrapper is still missing. See
+     * protocol-spec/99-audit.md "Known wire-format gap". */
     int n = E_IF_encode(s->enc, 8, pcm, out, 0);
     return n < 0 ? -1 : n;
 }

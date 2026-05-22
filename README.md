@@ -309,6 +309,9 @@ OrgList, UsrGInfo, FtpInfo, WatchLeg, LegExt, GpsRec, CamInfo, Info, PlayInfo, R
 | Conference (`CC_CONFSTATUSREQ/RSP`) | wMsgIds defined | No FSM driver; needs admin-provisioned conf group to test |
 | File-attached IM | PASSTHROUGH JSON + `FtpInfo` parser | No FTP pickup leg — we see the FTP descriptor but don't fetch the attachment |
 | Talk-group routing (type=7) | Encoder requests gtype=7 | Server downgrades to type=2 for non-admin; calls won't bridge between members |
+| PTT channel RX | **Full end-to-end** — joins channel, auto-answers `CC_SETUP`, NAT-punches per-call port (from `IE 0x19 SDP` in the inbound `CC_SETUP`), receives AMR-WB RTP. Live-verified against `us.vham.net` channel 44600100 (446.001 MHz amateur). | — |
+| PTT channel TX | Encoder sends correct `CC_SETUP` with `IMType=GROUP`, leg_id=9, subcode=`00`. Server `TAP-ACK`s. RTP sent to media gateway. | Server doesn't return `CC_SETUPACK`/`CC_CONN` and never allocates a per-call media port — silent-activated accounts are gated to RX-only on amateur channels. Admin would need to link the vhamid to an FCC callsign via `findVhamid` to permit TX. |
+| AMR-WB RTP packetization | Encoder/decoder via libvo-amrwbenc + libopencore-amrwb (offline round-trips work) | Encoder writes IF1 storage format (TS 26.201 §A.2). RTP-wire needs RFC 4867 §4.4 octet-aligned conversion — ~50 LOC outstanding. |
 
 ### Not supported
 

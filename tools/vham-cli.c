@@ -1229,8 +1229,10 @@ static int cmd_listen(args_t *a) {
                            (struct sockaddr *)&dst, sizeof dst);
                     usleep(20*1000);
                 }
-                printf("[rtp] punched per-call port %u:%u pt=%u\n",
-                       peer_ip, peer_port, peer_pt);
+                printf("[rtp] punched per-call %u.%u.%u.%u:%u pt=%u\n",
+                       (peer_ip >> 24)&0xff, (peer_ip >> 16)&0xff,
+                       (peer_ip >>  8)&0xff,  peer_ip       &0xff,
+                       peer_port, peer_pt);
                 /* Remember for the keepalive loop */
                 cli.media_gw_ipv4 = peer_ip;
                 cli.media_gw_port = peer_port;
