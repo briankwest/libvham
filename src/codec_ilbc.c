@@ -1,10 +1,14 @@
 /* libvham/src/codec_ilbc.c — iLBC backend via libilbc (WebRTC iLBC, BSD).
  *
- * Configured for 20 ms frames at 8 kHz = 160 samples → 38 bytes/frame.
- * (Alternative 30 ms / 240 samples → 50 bytes/frame exists but the
- * audit-table reserves PT 102 for the 20 ms variant.)
+ * The radio's idt.ini specifies:
+ *   [RTP_AUDIO_0] CODE=106 PKGTIME=60
+ * meaning iLBC at PT 106 (dynamic) with 60 ms packetization — three
+ * 20 ms iLBC frames per RTP packet, 38 bytes each → 114-byte payload.
  *
- * Enabled with VHAM_WITH_ILBC.
+ * The encoder accepts EITHER:
+ *   n_samples == 160 (20 ms, one frame, 38 bytes out)
+ *   n_samples == 480 (60 ms, three frames, 114 bytes out — what the
+ *                     radio uses on the wire)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -24,16 +28,32 @@ static ilbc_state_t g_state;
 
 #define ILBC_FRAME_SAMPLES  160      /* 20 ms @ 8 kHz */
 #define ILBC_FRAME_BYTES     38
+#define ILBC_PKT_SAMPLES    480      /* 60 ms = 3 × 20 ms */
+#define ILBC_PKT_BYTES      (ILBC_FRAME_BYTES * 3)
 
 static int ilbc_enc(vham_audio_codec_t *c,
                     const int16_t *pcm, size_t n_samples,
                     uint8_t *out, size_t out_cap) {
     ilbc_state_t *s = (ilbc_state_t *)c->state;
     if (!s || !s->enc) return -1;
-    if (n_samples != ILBC_FRAME_SAMPLES) return -1;
-    if (out_cap < ILBC_FRAME_BYTES) return -1;
-    int n = WebRtcIlbcfix_Encode(s->enc, pcm, n_samples, out);
-    return n;
+    if (n_samples == ILBC_FRAME_SAMPLES) {
+        if (out_cap < ILBC_FRAME_BYTES) return -1;
+        return WebRtcIlbcfix_Encode(s->enc, pcm, n_samples, out);
+    }
+    if (n_samples == ILBC_PKT_SAMPLES) {
+        if (out_cap < ILBC_PKT_BYTES) return -1;
+        int total = 0;
+        for (int i = 0; i < 3; ++i) {
+            int n = WebRtcIlbcfix_Encode(s->enc,
+                                         pcm + i * ILBC_FRAME_SAMPLES,
+                                         ILBC_FRAME_SAMPLES,
+                                         out + total);
+            if (n != ILBC_FRAME_BYTES) return -1;
+            total += n;
+        }
+        return total;
+    }
+    return -1;
 }
 
 static int ilbc_dec(vham_audio_codec_t *c,
@@ -48,8 +68,8 @@ static int ilbc_dec(vham_audio_codec_t *c,
 }
 
 static vham_audio_codec_t ilbc = {
-    .payload_type = 102, .name = "iLBC", .clock_rate = 8000,
-    .channels = 1, .frame_samples = ILBC_FRAME_SAMPLES,
+    .payload_type = 106, .name = "iLBC", .clock_rate = 8000,
+    .channels = 1, .frame_samples = ILBC_PKT_SAMPLES,   /* 60 ms default */
     .encode = ilbc_enc, .decode = ilbc_dec,
     .state = &g_state,
 };

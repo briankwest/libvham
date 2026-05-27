@@ -114,6 +114,76 @@ int vham_build_sdp_body(const vham_sdp_t *s, void *out, size_t out_cap) {
     return (int)b.off;
 }
 
+int vham_build_sdp_offer_audio(uint32_t ipv4_host, uint16_t port_host,
+                               void *out, size_t out_cap) {
+    /* Captured-bytes reference: a real radio's outbound channel SETUP
+     * from us.vham.net.  This is the exact SDP layout the binary's
+     * CIDTLeg::InitMySdp produces, byte-for-byte. */
+    vham_sdp_t s = {
+        .origin_ipv4   = ipv4_host,
+        .origin_port   = port_host,
+        .origin_family = 0xcc,
+        .origin_pad    = 0xcc,
+        .media_count   = 1,
+    };
+    vham_sdp_media_t *m = &s.media[0];
+    m->media_type    = 1;       /* audio */
+    m->transport     = 1;       /* RTP/UDP */
+    m->ipv4          = ipv4_host;
+    m->port          = port_host;
+    m->family        = 0xcc;
+    m->pad           = 0xcc;
+    m->reserved      = 0x13;
+    m->codec_count   = 5;
+
+    /* codec[0] = AMR PT 97, 1 param ("<") */
+    m->codecs[0].payload_type   = 0x61;
+    m->codecs[0].encoding_param = 1;
+    m->codecs[0].clock_rate     = 8000;
+    m->codecs[0].num_params     = 1;
+    memcpy(m->codecs[0].name,    "AMR", 4);
+    memcpy(m->codecs[0].param_a, "<",   2);
+
+    /* The 3 non-AMR codecs share the ptime list: 20/40/60/80/100 ms */
+    static const char ptime_list[] = "\x14\x28\x3c\x50\x64";
+
+    /* codec[1] = iLBC PT 106 */
+    m->codecs[1].payload_type   = 106;
+    m->codecs[1].encoding_param = 1;
+    m->codecs[1].clock_rate     = 8000;
+    m->codecs[1].num_params     = 5;
+    memcpy(m->codecs[1].name,    "iLBC", 5);
+    memcpy(m->codecs[1].param_a, ptime_list, 5);
+    m->codecs[1].param_a[5] = 0;
+
+    /* codec[2] = PCMU PT 0 */
+    m->codecs[2].payload_type   = 0;
+    m->codecs[2].encoding_param = 1;
+    m->codecs[2].clock_rate     = 8000;
+    m->codecs[2].num_params     = 5;
+    memcpy(m->codecs[2].name,    "PCMU", 5);
+    memcpy(m->codecs[2].param_a, ptime_list, 5);
+    m->codecs[2].param_a[5] = 0;
+
+    /* codec[3] = PCMA PT 8 */
+    m->codecs[3].payload_type   = 8;
+    m->codecs[3].encoding_param = 1;
+    m->codecs[3].clock_rate     = 8000;
+    m->codecs[3].num_params     = 5;
+    memcpy(m->codecs[3].name,    "PCMA", 5);
+    memcpy(m->codecs[3].param_a, ptime_list, 5);
+    m->codecs[3].param_a[5] = 0;
+
+    /* codec[4] = AMR-NB PT 116, clock 4750 (binary's IF2 variant slot) */
+    m->codecs[4].payload_type   = 0x74;
+    m->codecs[4].encoding_param = 1;
+    m->codecs[4].clock_rate     = 0x128e;
+    m->codecs[4].num_params     = 0;
+    memcpy(m->codecs[4].name,    "AMR-NB", 7);
+
+    return vham_build_sdp_body(&s, out, out_cap);
+}
+
 /* ---------- DECODER ---------- */
 
 /* tiny streaming reader */

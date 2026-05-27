@@ -111,6 +111,27 @@ typedef struct {
 /* Encode the SDP body. Returns bytes written, -1 on error. */
 int vham_build_sdp_body(const vham_sdp_t *s, void *out, size_t out_cap);
 
+/* Build the canonical audio-only SDP offer (IE 0x19 body) that the
+ * radio's binary sends — 5 codecs in the exact order, with the exact
+ * ptime params, that vham.net's bridge accepts:
+ *
+ *   codec[0]  PT 97  AMR    8000 1 param "<"
+ *   codec[1]  PT 106 iLBC   8000 5 params (ptime 20/40/60/80/100 ms)
+ *   codec[2]  PT 0   PCMU   8000 5 params (same ptime list)
+ *   codec[3]  PT 8   PCMA   8000 5 params (same ptime list)
+ *   codec[4]  PT 116 AMR-NB 4750 (1 param, no ptime list)
+ *
+ * media_type=1 (audio), transport=1 (RTP/UDP), reserved=0x13,
+ * family/pad = 0xcc 0xcc (LinkPoon "no family" sentinel).
+ *
+ * `ipv4_host` is normally 0 — CIDTLeg::InitMySdp puts IP=0 and lets
+ * the server learn the actual source from observed RTP. `port_host`
+ * is the local RTP port (MEDPORT_BASE + leg_id*4 by binary convention).
+ *
+ * Returns bytes written, -1 on overflow. */
+int vham_build_sdp_offer_audio(uint32_t ipv4_host, uint16_t port_host,
+                               void *out, size_t out_cap);
+
 /* Decode the SDP body. Returns 0 on success, -1 on malformed. */
 int vham_parse_sdp_body(const void *in, size_t in_len, vham_sdp_t *s);
 

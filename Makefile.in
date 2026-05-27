@@ -18,7 +18,7 @@ SRCS = src/codec.c src/md5.c src/auth.c src/regreq.c src/decoder.c \
        src/passthrough.c src/oam.c src/codec_audio.c src/jitter.c \
        src/rtcp.c src/retx.c src/segment.c src/im.c src/gps.c \
        src/tokenstore.c src/h264.c src/srtp.c src/causes.c \
-       src/envcfg.c \
+       src/envcfg.c src/nat.c src/voice_call.c \
        @VHAM_FEATURE_SRCS@
 OBJS = $(SRCS:.c=.o)
 LIB  = libvham.a

@@ -61,6 +61,14 @@ typedef struct {
 
     /* Optional private number (IE 0x7e — set when caller has a sub-num) */
     const char *priv_num;
+
+    /* Channel/group call flag — true when the target is a numeric
+     * channel (e.g. 44600100). The Android app uses SrvType=0x11
+     * (HALF_DUPLEX) for both channel and user-to-user calls; the
+     * channel-specific IEs (0x27/0x28/0x2e/0x30/0x36/0x45/0x46/0x47/
+     * 0x7a) are gated by this flag, not by service_type. From
+     * com.ids.idtma.media.CSAudio.groupAudioCall (calls 17/GROUP). */
+    int        is_channel_call;
 } vham_cc_setup_t;
 
 /* Build a CC_SETUP datagram (TAP header + SRVMSG header + IEs).
@@ -100,6 +108,17 @@ typedef struct {
     /* Remote SDP (the answer) */
     int         have_remote_sdp;
     vham_sdp_t  remote_sdp;
+
+    /* Per-call media destination — auto-updated whenever a received
+     * frame carries IE 0x19 SDP with a non-zero media[0] port. This
+     * is what the cli's RTP loop should `sendto`.  CC_MODIFY (cmd 0x57)
+     * uses this same path so mid-call redirects are handled silently.
+     *
+     * Set to non-zero only after we observe a port; the caller can
+     * compare against its current sendto target on each RTP frame to
+     * detect changes. */
+    uint32_t    remote_media_ip;     /* host order */
+    uint16_t    remote_media_port;   /* host order */
 
     /* Cause of failure / release (IE 0x12 / IE 0x40) */
     uint32_t    last_cause;
@@ -151,6 +170,59 @@ vham_call_state_t vham_cc_call_recv(vham_cc_call_t *c,
  * or release (action=2). Mirrors `CCFsm::MicCtrl @ 0x2f19f8`.
  * Returns bytes written, or -1 on error. */
 int vham_cc_call_mic_grant(vham_cc_call_t *c, int action,
+                           void *out, size_t out_cap);
+
+/* Generic CC_INFO sender — mirrors CCFsm::UserSendInfo @ 0x2f33a8.
+ * action codes per CCFsm::RecvInfoProc case table:
+ *   1 = MicReq, 2 = MicRel, 5 = TalkingID indication,
+ *   0xf = SDP modify, 0x14 = full info modify.
+ * `str` is the optional IE 0x15 trailing string (NULL/empty omits it). */
+int vham_cc_call_send_info(vham_cc_call_t *c, uint32_t action,
+                           const char *str,
+                           void *out, size_t out_cap);
+
+/* CC_INFO action=5 — TalkingID announcement. Tells channel members
+ * "this user is now the active talker"; the radio's UI shows the
+ * talker by reading IE 0x27. Mirrors `CCFsm::RecvInfoProc case 5`
+ * which calls TalkingIDInd2User to update the display. */
+int vham_cc_call_talking_id(vham_cc_call_t *c,
+                            void *out, size_t out_cap);
+
+/* Callback type for emit-and-send helpers. Invoked once per built
+ * packet. The caller wraps their socket send (`send()`, `sendto()`,
+ * etc.) and stuffs the fd / sockaddr into `ctx`. Return non-zero to
+ * abort the sequence. */
+typedef int (*vham_packet_send_fn)(const void *buf, size_t len, void *ctx);
+
+/* Emit the mic-acquisition triplet that the radio's binary sends to
+ * become the active talker on a channel. In order:
+ *
+ *   1. CC_INFO action=1   (MicReq)         — CCFsm::MicCtrl
+ *   2. CC_USERCTRL action=1                — CC::UserCtrl
+ *   3. CC_INFO action=5   (TalkingID)      — CCFsm::UserSendInfo
+ *
+ * Each frame is built into a small temporary buffer and handed to
+ * `send_fn`. Without #2 the media bridge doesn't recognize our leg as
+ * a valid source; without #3 the radio's display never updates to
+ * show "<our num> transmitting".
+ *
+ * Returns 0 on success, -1 if any build step fails (in which case
+ * earlier packets in the triplet may already have been sent). */
+int vham_cc_call_claim_mic(vham_cc_call_t *c,
+                           vham_packet_send_fn send_fn, void *ctx);
+
+/* Build a CC_USERCTRL (wMsgId 0x5b) frame carrying IE 0x54
+ * _TLV_CALLUSERCTRL_s. Mirrors `CC::UserCtrl @ 0x2f5658` — both
+ * dwDstFsmId and dwSrcFsmId are set to -1 because this is a
+ * standalone "talker announcement" not tied to a particular leg.
+ *
+ *   action = 1 — we're claiming the mic / starting to talk
+ *   action = 2 — we're releasing / done talking
+ *
+ * For channel/group PTT this is what the radio's binary sends right
+ * after CC_INFO action=1 so the server's media bridge knows which
+ * leg's audio to forward to the rest of the channel. */
+int vham_cc_call_user_ctrl(vham_cc_call_t *c, int action,
                            void *out, size_t out_cap);
 
 /* Build a CC_REL frame with a cause code in IE 0x40. Mirrors

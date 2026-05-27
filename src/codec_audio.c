@@ -90,19 +90,23 @@ static int unsupported_decode(vham_audio_codec_t *c,
     return -1;
 }
 
+/* PTs match vham.net's SdpFillPtParam codec table:
+ *   'a' → 0x61=97  AMR-NB
+ *   'k' → 0x6b=107 AMR-WB
+ *   'l' → 0x6a=106 iLBC (radio's CODE=106 PKGTIME=60) */
 static vham_audio_codec_t amrnb_stub = {
-    .payload_type = 96, .name = "AMR", .clock_rate = 8000,
+    .payload_type = 97, .name = "AMR", .clock_rate = 8000,
     .channels = 1, .frame_samples = 160,
     .encode = unsupported_encode, .decode = unsupported_decode,
 };
 static vham_audio_codec_t amrwb_stub = {
-    .payload_type = 97, .name = "AMR-WB", .clock_rate = 16000,
+    .payload_type = 107, .name = "AMR-WB", .clock_rate = 16000,
     .channels = 1, .frame_samples = 320,
     .encode = unsupported_encode, .decode = unsupported_decode,
 };
 static vham_audio_codec_t ilbc_stub = {
-    .payload_type = 102, .name = "iLBC", .clock_rate = 8000,
-    .channels = 1, .frame_samples = 160,
+    .payload_type = 106, .name = "iLBC", .clock_rate = 8000,
+    .channels = 1, .frame_samples = 480,
     .encode = unsupported_encode, .decode = unsupported_decode,
 };
 

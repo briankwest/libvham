@@ -141,8 +141,12 @@ enum vham_ie_tag {
     VHAM_IE_CC_SUBCODE     = 0x0045, /* TLV_NUMBER — channel sub-code (CTCSS-like "Password" on vham.net) */
     VHAM_IE_CC_CALL_EXTNUM = 0x0047, /* TLV_NUMBER — extended called (when '*' present) */
     VHAM_IE_CC_CALLUSERCTRL= 0x0054, /* _TLV_CALLUSERCTRL_s — PTT mic grant payload */
-    VHAM_IE_CC_MIC_ACTION  = 0x0063, /* u32 — CC_INFO MicCtrl action (1=req, 2=rel) */
-    VHAM_IE_CC_MIC_IMTYPE  = 0x0064, /* str — IMType for the call ("GROUP", etc.) */
+    /* IE 0x15 carries CC_INFO action (CCFsm::MicCtrl @ 0x2f19f8, decoded
+     * by CCFsm::RecvInfoProc @ 0x2f3bc4): u32 action + optional str.
+     * action: 1=MicReq, 2=MicRel, 5=TalkingID, 0xf=SDP-modify, 0x14=Info. */
+    VHAM_IE_INFO           = 0x0015,
+    VHAM_IE_CC_MIC_ACTION  = 0x0063, /* u32 — legacy slot; binary uses IE 0x15 */
+    VHAM_IE_CC_MIC_IMTYPE  = 0x0064, /* str — legacy slot; binary uses IE 0x15 */
     VHAM_IE_CC_CALLSTREAMCTRL = 0x0055, /* _TLV_CALLSTREAMCTRL_s */
     VHAM_IE_CC_CALLCONF    = 0x0053, /* CallConf: 11×u8 + NUL-string */
     VHAM_IE_CC_CAMINFO     = 0x002e, /* SrvPackCamInfo — 17-byte composite */

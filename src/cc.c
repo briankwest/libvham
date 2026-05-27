@@ -140,6 +140,7 @@ int vham_cc_call_emit(vham_cc_call_t *c,
         }
         s.display_str = peer_is_numeric ? "GROUP"
                                          : "{\"pfCallIn\": \"HALFSINGLE\"}";
+        s.is_channel_call = peer_is_numeric;
         /* CallConf bytes — the binary sets these for both half-duplex
          * single calls AND channel/group calls (full-duplex 0x12). The
          * marker triplet {1, 1, 1} at offsets 0, 1, 9 is the
@@ -221,8 +222,23 @@ vham_call_state_t vham_cc_call_recv(vham_cc_call_t *c,
         }
         case VHAM_IE_CC_SDP_A:
         case 0x001a:                   /* SDP block B (answer) */
-            if (vham_parse_sdp_body(ie.value, ie.len, &c->remote_sdp) == 0)
+            if (vham_parse_sdp_body(ie.value, ie.len, &c->remote_sdp) == 0) {
                 c->have_remote_sdp = 1;
+                /* If the SDP advertises a non-zero media[0] port, learn
+                 * it as the per-call destination. CC_MODIFY uses the
+                 * same IE 0x19, so mid-call redirects propagate here
+                 * without any caller-side parsing. The remote IP is 0
+                 * in SETUPs (the binary's "let server figure it out"
+                 * convention); when 0, we keep whatever IP the caller
+                 * has been using (typically the base media_gw_ipv4). */
+                if (c->remote_sdp.media_count > 0 &&
+                    c->remote_sdp.media[0].port != 0) {
+                    c->remote_media_port = c->remote_sdp.media[0].port;
+                    if (c->remote_sdp.media[0].ipv4 != 0) {
+                        c->remote_media_ip = c->remote_sdp.media[0].ipv4;
+                    }
+                }
+            }
             break;
         case VHAM_IE_CC_CALLUSERCTRL: {
             vham_call_userctrl_t uc;
@@ -291,8 +307,12 @@ static int cc_header_open(vham_buf_t *b, vham_cc_call_t *c,
     if (vham_pack_u32(b, 0)) return -1;
     *body_start = b->off;
 
+    /* All CC messages cross the MM dispatcher: CCFsm::MicCtrl @ 0x2f19f8,
+     * CCFsm::Rel @ 0x2ebea0, CCFsm::RecvConnProc @ 0x2ed748 (CC_CONNACK),
+     * and CCFsm::UserMakeOut @ 0x2ec888 (CC_SETUP) all write ucDst=ucSrc=4
+     * directly. Using MOD_CC here previously was wrong. */
     vham_srvmsg_hdr_t sh = {
-        .ucDst = VHAM_MOD_CC, .ucSrc = VHAM_MOD_CC,
+        .ucDst = VHAM_MOD_MM, .ucSrc = VHAM_MOD_MM,
         .wMsgId = cmd,
         .dwDstFsmId = c->have_remote_leg ? c->remote_leg_id : 0xffffffff,
         .dwSrcFsmId = c->leg_id,
@@ -376,11 +396,13 @@ int vham_cc_call_info_ack(vham_cc_call_t *c, void *out, size_t out_cap) {
                            srv_len_off, srv_body);
 }
 
-int vham_cc_call_mic_grant(vham_cc_call_t *c, int action,
+/* Send any CC_INFO action — generic helper that mirrors CCFsm::UserSendInfo
+ * @ 0x2f33a8. Wire: IE 0x27 (our num) + IE 0x15 (u32 action + optional str).
+ *   action=1: MicReq, action=2: MicRel, action=5: TalkingID announcement. */
+int vham_cc_call_send_info(vham_cc_call_t *c, uint32_t action,
+                           const char *str,
                            void *out, size_t out_cap) {
     if (!c || !out) return -1;
-    if (action != VHAM_USERCTRL_REQUEST && action != VHAM_USERCTRL_RELEASE)
-        return -1;
 
     vham_buf_t b;
     vham_buf_init(&b, out, out_cap);
@@ -388,27 +410,113 @@ int vham_cc_call_mic_grant(vham_cc_call_t *c, int action,
     if (cc_header_open(&b, c, VHAM_CC_INFO, &tap_len_off, &body_start,
                        &srv_len_off, &srv_body) != 0) return -1;
 
-    /* Mirrors CCFsm::MicCtrl @ 0x2f19f8. The binary emits:
-     *   IE 0x63 (u32) = action  (1 = request, 2 = release)
-     *   IE 0x64 (str) = IMType  ("GROUP" for channel, etc.)
-     *   IE 0x27 (str) = our dispatch number (SrvFillNum at offset 0x83e0)
-     *
-     * Earlier we mistakenly used IE 0x54 (CallUserCtrl composite) here;
-     * that's a *different* CC operation. */
-    if (vham_pack_tlv_u32(&b, 1, VHAM_IE_CC_MIC_ACTION,
-                          (uint32_t)action)) return -1;
-    /* IMType — peer_num is the channel/peer number; for channel calls
-     * the IMType in the original CC_SETUP was "GROUP". We mirror that
-     * by emitting peer_num here; production callers can override via
-     * vham_cc_call_t.priv_num if a different IMType is needed. */
-    if (c->peer_num[0]) {
-        if (vham_pack_tlv_str(&b, 1, VHAM_IE_CC_MIC_IMTYPE, c->peer_num))
-            return -1;
-    }
     if (c->my_num[0]) {
         if (vham_pack_tlv_str(&b, 1, VHAM_IE_IDENTITY_NUM, c->my_num))
             return -1;
     }
+    /* IE 0x15 INFO body: u32 action + optional NUL-terminated str.
+     * SrvPackInfo @ 0x268070: length = 4 if empty str, 4 + strlen + 1 if not. */
+    int has_str = (str && *str);
+    uint16_t ie_len = (uint16_t)(has_str ? 4 + strlen(str) + 1 : 4);
+    if (vham_pack_u16(&b, VHAM_IE_INFO))   return -1;
+    if (vham_pack_u16(&b, ie_len))         return -1;
+    if (vham_pack_u32(&b, action))         return -1;
+    if (has_str) {
+        if (vham_pack_str(&b, str))        return -1;
+    }
+    return cc_header_close(&b, c, tap_len_off, body_start,
+                           srv_len_off, srv_body);
+}
+
+int vham_cc_call_mic_grant(vham_cc_call_t *c, int action,
+                           void *out, size_t out_cap) {
+    if (action != VHAM_USERCTRL_REQUEST && action != VHAM_USERCTRL_RELEASE)
+        return -1;
+    return vham_cc_call_send_info(c, (uint32_t)action, NULL, out, out_cap);
+}
+
+/* CC_INFO action=5 TalkingID — announces "user X is now the talker" to
+ * channel members. The radio's display shows the talker by reading the
+ * IE 0x27 num from the broadcast. CCFsm::RecvInfoProc case 5 @ 0x2f3bc4
+ * routes this to TalkingIDInd2User. */
+int vham_cc_call_talking_id(vham_cc_call_t *c,
+                            void *out, size_t out_cap) {
+    return vham_cc_call_send_info(c, 5, c->my_num, out, out_cap);
+}
+
+int vham_cc_call_claim_mic(vham_cc_call_t *c,
+                           vham_packet_send_fn send_fn, void *ctx) {
+    if (!c || !send_fn) return -1;
+    uint8_t buf[256];
+    int n;
+    /* (1) CC_INFO mic-grant */
+    n = vham_cc_call_mic_grant(c, VHAM_USERCTRL_REQUEST, buf, sizeof buf);
+    if (n <= 0) return -1;
+    if (send_fn(buf, (size_t)n, ctx) != 0) return -1;
+    /* (2) CC_USERCTRL talker-claim */
+    n = vham_cc_call_user_ctrl(c, VHAM_USERCTRL_REQUEST, buf, sizeof buf);
+    if (n <= 0) return -1;
+    if (send_fn(buf, (size_t)n, ctx) != 0) return -1;
+    /* (3) CC_INFO TalkingID announcement */
+    n = vham_cc_call_talking_id(c, buf, sizeof buf);
+    if (n <= 0) return -1;
+    if (send_fn(buf, (size_t)n, ctx) != 0) return -1;
+    return 0;
+}
+
+/* CC::UserCtrl @ 0x2f5658 emits wMsgId 0x5b with both dwDstFsmId AND
+ * dwSrcFsmId set to -1 (it's a standalone "who is the talker" event,
+ * not tied to a specific leg). IE 0x54 _TLV_CALLUSERCTRL_s carries:
+ *   str(32) num_a — the talker  (us)
+ *   str(32) num_b — the target  (peer/channel)
+ *   u8      action (1=req/start, 2=rel/end)
+ *   u8[4]   extra (timestamp/reserved). */
+int vham_cc_call_user_ctrl(vham_cc_call_t *c, int action,
+                           void *out, size_t out_cap) {
+    if (!c || !out) return -1;
+    if (action != VHAM_USERCTRL_REQUEST && action != VHAM_USERCTRL_RELEASE)
+        return -1;
+
+    vham_buf_t b;
+    vham_buf_init(&b, out, out_cap);
+
+    /* TAP header */
+    if (vham_pack_u8 (&b, 0x01)) return -1;
+    if (vham_pack_u8 (&b, 0x00)) return -1;
+    if (vham_pack_u16(&b, VHAM_TAP_FLAG_NORMAL)) return -1;
+    if (vham_pack_u32(&b, c->seq_no)) return -1;
+    if (vham_pack_u16(&b, VHAM_TAP_CLASS_CC)) return -1;
+    if (vham_pack_u16(&b, VHAM_CC_USERCTRL)) return -1;
+    size_t tap_len_off = b.off;
+    if (vham_pack_u32(&b, 0)) return -1;
+    size_t body_start = b.off;
+
+    /* SRVMSG header — both FSM ids = -1 per the decompile. */
+    vham_srvmsg_hdr_t sh = {
+        .ucDst = VHAM_MOD_MM, .ucSrc = VHAM_MOD_MM,
+        .wMsgId = VHAM_CC_USERCTRL,
+        .dwDstFsmId = 0xffffffff,
+        .dwSrcFsmId = 0xffffffff,
+    };
+    size_t srv_len_off;
+    if (vham_pack_srvmsg_header(&b, &sh, &srv_len_off)) return -1;
+    size_t srv_body = b.off;
+
+    /* IE 0x54 _TLV_CALLUSERCTRL_s — built via the helper so the byte
+     * layout matches SrvPackCallUserCtrl @ 0x267a90 exactly. The
+     * `extra[4]` slot carries the first 4 bytes of MediaAttr — see
+     * com.ids.idtma.jni.aidl.MediaAttribute(1,0,0,0) used by
+     * CSAudio.groupAudioCall: ucAudioSend=1, ucAudioRecv=0,
+     * ucVideoSend=0, ucVideoRecv=0 → 01 00 00 00. */
+    vham_call_userctrl_t uc = { .action = (uint8_t)action,
+                                .extra = { 0x01, 0x00, 0x00, 0x00 } };
+    strncpy(uc.num_a, c->my_num,   sizeof uc.num_a - 1);
+    strncpy(uc.num_b, c->peer_num, sizeof uc.num_b - 1);
+    uint8_t ie_buf[80];
+    int ie_len = vham_encode_call_userctrl(&uc, ie_buf, sizeof ie_buf);
+    if (ie_len <= 0) return -1;
+    if (vham_pack_tlv_fix(&b, 1, VHAM_IE_CC_CALLUSERCTRL,
+                          ie_buf, (size_t)ie_len)) return -1;
 
     return cc_header_close(&b, c, tap_len_off, body_start,
                            srv_len_off, srv_body);
@@ -482,10 +590,13 @@ int vham_build_cc_setup(const vham_cc_setup_t *p, void *out, size_t out_cap) {
         return -1;
     if (vham_pack_tlv_u32(&b, 1, VHAM_IE_CC_SERVICE, p->service_type))
         return -1;
-    /* Channel calls (FULL_DUPLEX) include IEs 0x2e/0x30/0x36 that
-     * half-duplex single calls omit. Byte-pattern matched against
-     * a captured inbound channel SETUP from us.vham.net. */
-    if (p->service_type == VHAM_CALL_FULL_DUPLEX) {
+    /* Channel/group calls include IEs 0x27/0x28/0x2e/0x30/0x36/0x45/
+     * 0x46/0x47/0x7a. The Android app
+     * (com.ids.idtma.media.CSAudio.groupAudioCall) uses
+     * SrvType=0x11 (HALF_DUPLEX) — same as user-to-user — and gates
+     * channel IEs on the IMType=="GROUP" string. We pass that via
+     * the `is_channel_call` flag. */
+    if (p->is_channel_call) {
         /* IE 0x27 (our num) — duplicated as IE 0x28 by some servers
          * and the real client; harmless to repeat. */
         if (vham_pack_tlv_str(&b, 1, VHAM_IE_IDENTITY_NUM, p->calling_num))
@@ -515,11 +626,11 @@ int vham_build_cc_setup(const vham_cc_setup_t *p, void *out, size_t out_cap) {
         vham_pack_tlv_str(&b, 1, VHAM_IE_CC_SUBCODE, p->channel_subcode))
         return -1;
 
-    /* For channel calls (FULL_DUPLEX), the binary emits the channel
-     * number in IE 0x45 (str), IE 0x46 (str), AND IE 0x47 (TLV_NUMBER).
-     * Plus IE 0x7a (u8=2). IE 0x53/0x76 are NOT emitted for channel
-     * calls — those are for user-to-user (HALF_DUPLEX) only. */
-    if (p->service_type == VHAM_CALL_FULL_DUPLEX
+    /* For channel/group calls the binary emits the channel number in
+     * IE 0x45 (str), IE 0x46 (str), AND IE 0x47 (TLV_NUMBER), plus IE
+     * 0x7a (u8=2). IE 0x53/0x76 are NOT emitted for channel calls —
+     * those are for user-to-user only. */
+    if (p->is_channel_call
         && p->channel_subcode && *p->channel_subcode) {
         if (vham_pack_tlv_str(&b, 1, VHAM_IE_CC_CHAN_NAME, p->channel_subcode))
             return -1;
