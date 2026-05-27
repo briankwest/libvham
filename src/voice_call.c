@@ -23,6 +23,20 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Setup-phase timing — emit only when VHAM_VC_TIMING=1 in the env. */
+static void vc_phase(struct timeval *t0, struct timeval *prev,
+                     const char *label) {
+    const char *e = getenv("VHAM_VC_TIMING");
+    if (!e || *e == '0') return;
+    struct timeval now; gettimeofday(&now, NULL);
+    long total = (now.tv_sec - t0->tv_sec) * 1000
+               + (now.tv_usec - t0->tv_usec) / 1000;
+    long dt    = (now.tv_sec - prev->tv_sec) * 1000
+               + (now.tv_usec - prev->tv_usec) / 1000;
+    fprintf(stderr, "  [vc t+%ldms] %s (+%ldms)\n", total, label, dt);
+    *prev = now;
+}
+
 /* idt.ini SYSTEM section: MEDPORT=20000 is the base; the binary's
  * CIDTLeg::InitMySdp computes the leg's RTP port as base+leg_id*4. */
 #define MEDPORT_BASE 20000
@@ -38,6 +52,7 @@ int vham_voice_call_setup(vham_voice_call_t *vc,
                           const vham_voice_call_opts_t *o) {
     if (!vc || !o || o->sig_fd < 0 || !o->seq_no) return -1;
     memset(vc, 0, sizeof *vc);
+    struct timeval vc_t0, vc_prev; gettimeofday(&vc_t0, NULL); vc_prev = vc_t0;
     vc->sig_fd            = o->sig_fd;
     vc->seq_no_ref        = o->seq_no;
     vc->payload_type      = o->payload_type;
@@ -58,9 +73,15 @@ int vham_voice_call_setup(vham_voice_call_t *vc,
     if (bind(vc->rtp_fd, (struct sockaddr *)&lo, sizeof lo) != 0) goto fail;
     vc->rtp_port = rtp_port;
 
-    /* ---- STUN probe (informational only) ------------------------- */
-    vham_stun_discover(vc->rtp_fd, "stun.l.google.com", 19302, 2000,
+    vc_phase(&vc_t0, &vc_prev, "rtp bind");
+
+    /* ---- STUN probe (informational only) -------------------------
+     * 500 ms — Google's STUN responder typically answers in <100 ms.
+     * If it doesn't come back fast enough we proceed without it; SDP
+     * advertises IP=0 either way, so STUN is purely diagnostic here. */
+    vham_stun_discover(vc->rtp_fd, "stun.l.google.com", 19302, 500,
                        &vc->pub_ip, &vc->pub_port);
+    vc_phase(&vc_t0, &vc_prev, "stun");
 
     /* ---- build SDP offer + send CC_SETUP ------------------------- */
     uint8_t sdp[1024];
@@ -83,11 +104,15 @@ int vham_voice_call_setup(vham_voice_call_t *vc,
                               buf, sizeof buf);
     if (n <= 0) goto fail;
     if (send(vc->sig_fd, buf, (size_t)n, 0) != (ssize_t)n) goto fail;
+    vc_phase(&vc_t0, &vc_prev, "cc_setup sent");
 
-    /* ---- recv loop: wait for CC_CONN with per-call media port ---- */
-    struct timeval tv_short = { .tv_sec = 6 };
+    /* ---- recv loop: wait for CC_CONN with per-call media port ----
+     * Short inner timeout (200 ms) so we tick the deadline often; the
+     * outer 4 s deadline still covers real wide-area RTTs. The server
+     * normally sends SETUPACK + CC_CONN within ~300 ms of CC_SETUP. */
+    struct timeval tv_short = { .tv_usec = 200 * 1000 };
     setsockopt(vc->sig_fd, SOL_SOCKET, SO_RCVTIMEO, &tv_short, sizeof tv_short);
-    time_t deadline = time(NULL) + 8;
+    time_t deadline = time(NULL) + 4;
     uint8_t resp[2048];
     int got_media = 0;
     while (time(NULL) < deadline && !got_media) {
@@ -110,6 +135,7 @@ int vham_voice_call_setup(vham_voice_call_t *vc,
             vc->call.state == VHAM_CALL_RELEASING) goto fail;
     }
     if (!got_media) goto fail;
+    vc_phase(&vc_t0, &vc_prev, "got per-call port");
 
     /* ---- send CC_CONNACK ----------------------------------------- */
     {
@@ -132,25 +158,11 @@ int vham_voice_call_setup(vham_voice_call_t *vc,
         if (vham_cc_call_claim_mic(&vc->call, vc_send_cb, &sctx) != 0)
             goto fail;
     }
+    vc_phase(&vc_t0, &vc_prev, "claim_mic sent");
 
-    /* Drain TAP-ACKs / CC_INFOACK that follow the triplet — best-effort. */
-    {
-        struct timeval drain_tv = { .tv_usec = 200 * 1000 };  /* 200 ms */
-        setsockopt(vc->sig_fd, SOL_SOCKET, SO_RCVTIMEO, &drain_tv,
-                   sizeof drain_tv);
-        for (int g = 0; g < 10; ++g) {
-            ssize_t r = recv(vc->sig_fd, resp, sizeof resp, 0);
-            if (r <= 0) break;
-            uint16_t flags = (uint16_t)((resp[2] << 8) | resp[3]);
-            if (flags != VHAM_TAP_FLAG_ACK) {
-                uint8_t ack[16];
-                int an = vham_tap_build_ack_for(resp, (size_t)r,
-                                                ack, sizeof ack);
-                if (an > 0) send(vc->sig_fd, ack, (size_t)an, 0);
-                vham_cc_call_recv(&vc->call, resp, (size_t)r);
-            }
-        }
-    }
+    /* No post-mic drain — pump_frame() drains signaling on every
+     * audio frame, so any leftover TAP-ACKs / CC_INFOACK after the
+     * triplet get picked up there. Saves ~100 ms of setup latency. */
 
     /* Make sig_fd non-blocking for the pump phase (we drain it
      * opportunistically per audio frame, never want to stall). */
@@ -163,7 +175,11 @@ int vham_voice_call_setup(vham_voice_call_t *vc,
                             vc->call.remote_media_port) != 0)
         goto fail;
 
-    /* ---- init RTP TX state + send 5 silence NAT-punch frames ----- */
+    /* ---- init RTP TX state + brief NAT-punch ---------------------
+     * 2 back-to-back silence frames — the FF D3 01 sentinel sent by
+     * vham_media_nat_open already created the NAT mapping; the silence
+     * frames just confirm the RTP path is open. No usleep between
+     * them — they go out immediately. */
     vham_codec_init();
     vham_voice_tx_init(&vc->tx, o->payload_type, (uint32_t)getpid());
     vham_voice_tx_set_mic(&vc->tx, 1);
@@ -172,7 +188,7 @@ int vham_voice_call_setup(vham_voice_call_t *vc,
                                   sizeof(int16_t));
         if (silence) {
             uint8_t pkt[2048];
-            for (int k = 0; k < 5; ++k) {
+            for (int k = 0; k < 2; ++k) {
                 int pn = vham_voice_tx_pcm_frame(&vc->tx, silence,
                                                  (size_t)o->samples_per_frame,
                                                  0, pkt, sizeof pkt);
@@ -180,13 +196,12 @@ int vham_voice_call_setup(vham_voice_call_t *vc,
                     sendto(vc->rtp_fd, pkt, (size_t)pn, 0,
                            (struct sockaddr *)&vc->media_dst,
                            sizeof vc->media_dst);
-                usleep((useconds_t)((uint64_t)o->samples_per_frame
-                                    * 1000000 / o->clock_rate));
             }
             free(silence);
         }
     }
 
+    vc_phase(&vc_t0, &vc_prev, "nat-punch done");
     vc->active = 1;
     return 0;
 

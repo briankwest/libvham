@@ -672,8 +672,25 @@ static int cmd_transmit(args_t *a) {
     uint32_t ip_be; uint16_t port;
     if (parse_server(a->server, &ip_be, &port) != 0) return usage();
 
+    /* Wall-clock telemetry — emits when VHAM_TIMING=1. */
+    struct timeval t_start, t_phase;
+    gettimeofday(&t_start, NULL); t_phase = t_start;
+    const char *_timing_env = getenv("VHAM_TIMING");
+    int _timing_on = _timing_env && *_timing_env != '0';
+    #define VHAM_PHASE(label) do {                                          \
+        if (!_timing_on) break;                                             \
+        struct timeval _now; gettimeofday(&_now, NULL);                     \
+        long _ms = (_now.tv_sec - t_phase.tv_sec) * 1000                    \
+                 + (_now.tv_usec - t_phase.tv_usec) / 1000;                 \
+        long _total = (_now.tv_sec - t_start.tv_sec) * 1000                 \
+                    + (_now.tv_usec - t_start.tv_usec) / 1000;              \
+        fprintf(stderr, "[t+%ldms] %s (+%ldms)\n", _total, (label), _ms);  \
+        t_phase = _now;                                                     \
+    } while (0)
+
     vham_reg_client_t cli; int sig_fd;
     if (do_login(a->user, a->pass, ip_be, port, &sig_fd, &cli) != 0) return 1;
+    VHAM_PHASE("login complete");
     if (!cli.have_media_gw) {
         fprintf(stderr, "transmit: REGRSP didn't include a media gateway\n");
         close(sig_fd); return 1;
@@ -685,19 +702,27 @@ static int cmd_transmit(args_t *a) {
            (cli.media_gw_ipv4) & 0xff,
            cli.media_gw_port);
 
-    /* Step 0 — handle YaoYun feature negotiation. After login the
-     * server pushes MM_PASSTHROUGH with `{"YaoYun":"<n>"}`. Per
-     * MM::UpdateYaoYun in the binary, the client MUST echo this
-     * back. Until the YaoYun gate flips to 0, IDT_CallMakeOut is
-     * blocked client-side AND the server treats our CC_SETUPs as
-     * no-op status updates (TAP-ACK + MM_REGRSP, no CC response).
-     * This is the missing handshake step. */
-    struct timeval tv = { .tv_sec = 1 };
-    setsockopt(sig_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    /* Pipeline STATUSSUBS + opportunistic YaoYun handling — fire the
+     * STATUSSUBS immediately so the server can process it concurrently
+     * with whatever it queued post-REGRSP, then drain everything in a
+     * single 150 ms pass. */
+    cli.seq_no += 1;
+    uint8_t sb[256];
+    int sn = vham_build_status_subs(cli.seq_no, a->user, a->to,
+                                    VHAM_SUBS_DETAILED, 1, sb, sizeof sb);
+    if (sn > 0) send(sig_fd, sb, (size_t)sn, 0);
+
+    /* Drain whatever arrives: YaoYun (MM_PASSTHROUGH), STATUSSUBS
+     * TAP-ACKs, MM_REGRSP notifies. 50 ms is enough — YaoYun is
+     * server-pushed within an RTT of REGRSP or never. */
+    {
+        struct timeval drain_tv = { .tv_usec = 50 * 1000 };
+        setsockopt(sig_fd, SOL_SOCKET, SO_RCVTIMEO, &drain_tv, sizeof drain_tv);
+    }
     uint8_t resp[2048];
-    for (int g = 0; g < 10; ++g) {
+    for (int g = 0; g < 8; ++g) {
         ssize_t r = recv(sig_fd, resp, sizeof resp, 0);
-        if (r < 0) break;
+        if (r <= 0) break;
         uint16_t flags = (uint16_t)((resp[2] << 8) | resp[3]);
         uint16_t cls   = (uint16_t)((resp[8]  << 8) | resp[9]);
         uint16_t cmd   = (uint16_t)((resp[10] << 8) | resp[11]);
@@ -715,20 +740,11 @@ static int cmd_transmit(args_t *a) {
                                                    "YaoYun", yy,
                                                    ack, sizeof ack);
                     if (an > 0) send(sig_fd, ack, (size_t)an, 0);
-                    break;
                 }
             }
         }
     }
-
-    /* Step 1 — STATUSSUBS so the server tags us as the channel TX. */
-    cli.seq_no += 1;
-    uint8_t sb[256];
-    int sn = vham_build_status_subs(cli.seq_no, a->user, a->to,
-                                    VHAM_SUBS_DETAILED, 1, sb, sizeof sb);
-    if (sn > 0) send(sig_fd, sb, (size_t)sn, 0);
-    /* Drain any TAP-ACK + notify echoes. */
-    for (int g = 0; g < 3; ++g) { if (recv(sig_fd, resp, sizeof resp, 0) <= 0) break; }
+    VHAM_PHASE("pre-call drained");
 
     /* Compute call mode early so the RTP-socket bind can use the
      * correct deterministic port (MEDPORT + leg_id * 4 per idt.ini).
@@ -784,6 +800,7 @@ static int cmd_transmit(args_t *a) {
         fprintf(stderr, "voice_call_setup failed\n");
         close(sig_fd); return 1;
     }
+    VHAM_PHASE("voice_call_setup complete");
     printf("local RTP port: %u\n", vham_voice_call_rtp_port(&vc));
     if (vc.pub_ip) {
         printf("[stun] our public RTP endpoint: %u.%u.%u.%u:%u\n",
