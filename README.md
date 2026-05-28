@@ -39,7 +39,7 @@ A clean-room C reimplementation of the **VHAM / IDS-IDTMA** push-to-talk-over-ce
 - [Performance: call setup latency](#performance-call-setup-latency)
 - [Testing](#testing)
 - [Layout](#layout)
-- [Legal](#legal)
+- [Legal and ethical use](#legal-and-ethical-use)
 
 ---
 
@@ -708,8 +708,40 @@ test/
 
 ---
 
-## Legal
+## Legal and ethical use
 
-This project documents the wire format and client behavior of a proprietary protocol by static analysis of a publicly distributed Android app, for interoperability purposes. It contains no copied source code and no proprietary code-paths reproduced byte-for-byte. The protocol's intellectual-property holders are not affiliated with this work.
+### Origin and scope
 
-Use against any server requires authorization from that server's operator. The default endpoints (`us.vham.net`, `th.vham.net`, `linkpoon.com`) are LinkPoon's commercial infrastructure — only use accounts you have permission to use.
+This project documents the wire format and client behavior of a proprietary protocol by static analysis of a publicly distributed Android app (`libsvcapi.so` from the LinkPoon app), for the purpose of independent interoperability. It contains no copied source code and reproduces no proprietary code paths byte-for-byte. The protocol's intellectual-property holders are not affiliated with, nor have they endorsed, this work. All trademarks are the property of their respective owners.
+
+The library is published under the terms in `LICENSE`. It is provided **as-is, without warranty of any kind**; the authors disclaim all liability for any use, misuse, damages, or other consequences arising from running it.
+
+### Required authorization
+
+Running libvham against any server requires explicit, prior authorization from that server's operator. The default endpoints (`us.vham.net`, `th.vham.net`, `linkpoon.com`, and any successor or affiliated infrastructure) are LinkPoon's commercial production network. **Do not run libvham against these endpoints, or any other VHAM-compatible server, except with accounts and on infrastructure you have written permission to test.**
+
+In particular, the existence of a publicly-known default password on the LinkPoon network (see [security review notes](#) — `111111` is shipped as the universal default on silent-activated accounts) does *not* constitute permission to log in as accounts that aren't yours. Account credentials that *happen to be guessable* are still other people's credentials. Logging in as another user without authorization is unlawful in virtually every jurisdiction this software might run in, irrespective of how weak the password is.
+
+### Prohibited uses
+
+You may not use libvham (or any derivative work) to:
+
+- **Impersonate** another user — log into accounts that aren't yours, send PASSTHROUGH/IM messages as another party, transmit voice on radio channels under another user's callsign or display name, or otherwise represent yourself as a third party.
+- **Surveil** third parties — passively or actively collect GPS reports, IMs, voice traffic, presence, channel membership, or any other personally identifiable information of users who have not consented to being observed.
+- **Disrupt** the network or its users — flood channels, tear down third-party calls via CC_REL, fabricate accounts to abuse free-tier limits, or interfere with normal operations.
+- **Create accounts on infrastructure you do not own.** The `vham-activate` tool exists to document the silent-activation HTTP flow we observed in the wild. Using it against LinkPoon's servers (or any server you don't operate) creates accounts on someone else's commercial infrastructure without their consent.
+- **Transmit on licensed radio spectrum without proper authorization.** PTT calls bridged through VHAM that egress onto amateur radio channels (e.g. 446.xxx MHz) are subject to the radio regulations of the jurisdiction where the egress occurs — including, in the United States, **FCC Part 97**. Transmitting under a callsign that is not your own, or without a valid license for the band you're hitting, is a federal offense in the US and broadly illegal elsewhere. The fact that the protocol allows it doesn't make it lawful.
+
+### Security research and responsible disclosure
+
+If you discover security weaknesses in the LinkPoon network or in any VHAM-compatible deployment, please disclose them responsibly to the operator before publishing exploit-grade material. Coordinated disclosure protects users; uncoordinated disclosure puts them at risk. The authors of libvham are not responsible for, and do not endorse, weaponization of any finding documented in this repository.
+
+If you are a representative of LinkPoon (or any other VHAM operator) and wish to coordinate on remediating the issues this codebase implicitly documents, open an issue or contact the maintainers privately.
+
+### Export and dual-use
+
+libvham implements cryptographic primitives via mbedtls / OpenSSL / libsrtp 2. Users are responsible for ensuring their use complies with the export-control regimes of their jurisdiction (e.g. EAR in the US, the EU Dual-Use Regulation). The library itself contains no novel cryptography and uses standard implementations of public algorithms.
+
+### No agency, no endorsement
+
+Nothing in this README, the project's documentation, or any associated communications should be read as legal advice. If you are unsure whether a particular use is lawful, consult an attorney in your jurisdiction *before* running the software.
