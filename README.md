@@ -64,7 +64,7 @@ The original `libsvcapi.so` is a stripped C++ shared library with ~3,800 mangled
 
 ```
        ┌───────────────────────────────────────────────────────────┐
-       │  tools/  vham-cli, vham-voice, vham-session, vham-call …   │
+       │  tools/  vham-cli, vham-voice, vham-session, vham-call …  │
        │          (thin CLIs over the public library API)          │
        └───────────────────────────────────────────────────────────┘
        ┌───────────────────────────────────────────────────────────┐
