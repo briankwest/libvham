@@ -322,7 +322,7 @@ This is the marquee operation. End-to-end audio confirmed against `us.vham.net` 
                                                 ↓
             ┌─────── audio pump (vham_voice_call_pump_frame, loop) ────────┐
             │  encode one PCM frame → RTP (per-codec packetization)        │
-            │  sendto media_dst                                             │
+            │  sendto media_dst                                            │
             │  every 2 s: re-send FF D3 01 NAT sentinel                    │
             │  opportunistic recv(sig_fd, MSG_DONTWAIT):                   │
             │      TAP-ACK each non-ACK frame                              │
